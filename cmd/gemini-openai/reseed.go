@@ -1,0 +1,411 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+)
+
+// History-rewrite reseed for the Gemini bridge, ported from chatgpt-proxy.
+//
+// opencode legitimately rewrites history (revert, fork/regeneration,
+// compact) which breaks the adapter's append-only prefix/delta assumption.
+// The interrupt-uncertain case belongs to recoverPending (exact adoption,
+// then hash-lineage auto-resync); this file covers the distinct REWRITE
+// case (incoming history is internally coherent but does not prefix-match
+// the journal).
+//
+// Order on the Dirty branch: adoption → auto-resync → dirty-reseed plan →
+// 409 + diagnosis (genuinely ambiguous only). On the clean branch a
+// coherent rewrite reseeds; incoherent input keeps the legacy full-history
+// fresh replay (clean sessions hold no uncertainty to protect).
+// The old thread is abandoned truthfully — no adoption comparison against
+// it — and the turn continues on a fresh Gemini chat as a normal
+// single-turn submission (bounded by maxChars like any fresh turn; there
+// is no chunked replay to split, so wrappers cannot be cut).
+
+// Rewrite classifications. "ambiguous" is not a rewrite: the incoming
+// history is internally incoherent, so no reseed is attempted.
+const (
+	rewriteTruncation = "rewrite-truncation" // revert/truncation: shorter, prefix-equal
+	rewriteDivergence = "rewrite-divergence" // fork/regeneration: same-length-but-diverged content
+	rewriteCompaction = "rewrite-compaction" // compaction: summarized system prefix
+	rewriteAmbiguous  = "ambiguous"          // incoherent: dangling/duplicate/unmatched tool results
+)
+
+// prefixMismatch contains structure only: which saved-journal index and
+// field the incoming history first diverges on. Never text or IDs.
+type prefixMismatch struct {
+	Index int
+	Field string
+}
+
+// rewritePlan is a validated fresh-chat reseed. carried holds committed
+// executed tool exchanges absent from the incoming history, in journal
+// order; notCarried names unknown-state items deliberately NOT carried
+// (fail closed). oldURL is the abandoned thread.
+type rewritePlan struct {
+	classification string
+	mismatchIndex  int
+	mismatchField  string
+	carried        []message
+	carriedIDs     []string
+	notCarried     []string
+	oldURL         string
+}
+
+// firstMismatch returns the first structural divergence of the saved
+// journal prefix against the incoming history, or nil when the journal is
+// a prefix of incoming (coherent append-only: no rewrite).
+func firstMismatch(incoming, saved []message) *prefixMismatch {
+	for i := range saved {
+		m := &prefixMismatch{Index: i}
+		if i >= len(incoming) {
+			m.Field = "history.truncated"
+			return m
+		}
+		a, b := incoming[i], saved[i]
+		switch {
+		case a.Role != b.Role:
+			m.Field = "role"
+		case a.Name != b.Name:
+			m.Field = "name"
+		case a.ToolCallID != b.ToolCallID:
+			m.Field = "tool_call_id"
+		case textOf(a) != textOf(b):
+			m.Field = "content"
+		case len(a.ToolCalls) != len(b.ToolCalls):
+			m.Field = "tool_calls.length"
+		default:
+			for j := range a.ToolCalls {
+				other := b.ToolCalls[j]
+				field := ""
+				switch {
+				case a.ToolCalls[j].ID != other.ID:
+					field = "id"
+				case a.ToolCalls[j].Type != other.Type:
+					field = "type"
+				case a.ToolCalls[j].Function.Name != other.Function.Name:
+					field = "function.name"
+				case !jsonEqual(a.ToolCalls[j].Function.Arguments, other.Function.Arguments):
+					field = "function.arguments"
+				}
+				if field != "" {
+					m.Field = fmt.Sprintf("tool_calls[%d].%s", j, field)
+					break
+				}
+			}
+		}
+		if m.Field != "" {
+			return m
+		}
+	}
+	return nil
+}
+
+// coherentTranscript reports whether msgs is internally coherent: valid
+// tool-call/result pairing in order (every tool result matches a prior
+// assistant call exactly once, results are nonempty, call IDs are nonempty
+// and unique) with no dangling calls.
+func coherentTranscript(msgs []message) bool {
+	pending := map[string]bool{}
+	seen := map[string]bool{}
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			for _, c := range m.ToolCalls {
+				if c.ID == "" || seen[c.ID] {
+					return false
+				}
+				seen[c.ID] = true
+				pending[c.ID] = true
+			}
+		} else if m.Role == "tool" {
+			if m.ToolCallID == "" || !pending[m.ToolCallID] || textOf(m) == "" {
+				return false
+			}
+			delete(pending, m.ToolCallID)
+		}
+	}
+	return len(pending) == 0
+}
+
+// isCompactionShape reports whether the incoming history opens with a
+// client compaction/summarization marker: a system message naming the
+// compaction. Anything else falls through to divergence.
+func isCompactionShape(incoming []message) bool {
+	if len(incoming) == 0 || incoming[0].Role != "system" {
+		return false
+	}
+	lower := strings.ToLower(textOf(incoming[0]))
+	return strings.Contains(lower, "compact") || strings.Contains(lower, "summar")
+}
+
+// classifyHistoryRewrite distinguishes HISTORY-REWRITE from append-only
+// continuation and from incoherence. It returns ("", nil) when the saved
+// journal is a prefix of incoming (no rewrite, no behavior change),
+// ("ambiguous", mm) when incoming is internally incoherent (never reseed),
+// and otherwise one of the rewrite kinds with structural mismatch
+// evidence. A nil saved journal is not a rewrite.
+func classifyHistoryRewrite(incoming, saved []message) (string, *prefixMismatch) {
+	mm := firstMismatch(incoming, saved)
+	if mm == nil || len(saved) == 0 {
+		return "", mm
+	}
+	if !coherentTranscript(incoming) {
+		return rewriteAmbiguous, mm
+	}
+	if mm.Field == "history.truncated" {
+		return rewriteTruncation, mm
+	}
+	if isCompactionShape(incoming) {
+		return rewriteCompaction, mm
+	}
+	return rewriteDivergence, mm
+}
+
+// canonArgs normalizes tool arguments exactly the way canonicalEqual does,
+// so a rewritten history that merely re-encodes arguments still matches
+// the executed call instead of duplicating it.
+func canonArgs(args string) string {
+	var v any
+	decoder := json.NewDecoder(strings.NewReader(args))
+	decoder.UseNumber()
+	if json.Valid([]byte(args)) && decoder.Decode(&v) == nil {
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+	}
+	return args
+}
+
+// callPresentIn reports whether the executed call survives in the incoming
+// rewritten history: same stable ID, or same function with canonically
+// equal arguments (a fork/regeneration that kept the call but minted IDs).
+func callPresentIn(call toolCall, incoming []message) bool {
+	for _, m := range incoming {
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, c := range m.ToolCalls {
+			if c.ID == call.ID {
+				return true
+			}
+			if c.Function.Name == call.Function.Name && canonArgs(c.Function.Arguments) == canonArgs(call.Function.Arguments) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// carryExecuted collects executed tool exchanges (assistant calls with
+// recorded results) that are ABSENT from the incoming rewritten history.
+// Execution proof comes from the committed journal plus, for dirty
+// sessions, the still-pending request: its contained tool results were
+// recorded by the client from previously delivered answers, so they are
+// known-executed even though the pending turn's own answer is unknown.
+// Carried messages travel in transcript order (whole assistant messages
+// plus their tool results, so the seed stays internally coherent).
+// incomplete names committed pairs still missing results after consulting
+// both sources: deliberately NOT carried. The pending turn's undelivered
+// answer is NOT decided here: the plan builders list it as not-carried.
+func carryExecuted(s *session, pending []message, incoming []message) (carried []message, carriedIDs []string, incomplete []string) {
+	results := map[string]message{}
+	for _, msgs := range [][]message{s.Messages, pending} {
+		for _, m := range msgs {
+			if m.Role == "tool" && m.ToolCallID != "" && textOf(m) != "" && results[m.ToolCallID].ToolCallID == "" {
+				results[m.ToolCallID] = m
+			}
+		}
+	}
+	seen := map[string]bool{}
+	for _, msgs := range [][]message{s.Messages, pending} {
+		for _, m := range msgs {
+			if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+				continue
+			}
+			complete := true
+			for _, c := range m.ToolCalls {
+				if _, ok := results[c.ID]; !ok {
+					complete = false
+					incomplete = append(incomplete, fmt.Sprintf("incomplete-committed:%s (no recorded result; not carried)", c.ID))
+				}
+			}
+			if !complete {
+				continue
+			}
+			needed := false
+			for _, c := range m.ToolCalls {
+				if seen[c.ID] {
+					continue
+				}
+				if !callPresentIn(c, incoming) {
+					needed = true
+					carriedIDs = append(carriedIDs, fmt.Sprintf("%s(%s)", c.ID, c.Function.Name))
+				}
+			}
+			if !needed {
+				continue
+			}
+			carried = append(carried, m)
+			for _, c := range m.ToolCalls {
+				seen[c.ID] = true
+				if r, ok := results[c.ID]; ok {
+					carried = append(carried, r)
+				}
+			}
+		}
+	}
+	return carried, carriedIDs, incomplete
+}
+
+// sentCompletedFor reports whether the sent-log records a completed
+// submission of the given prompt hash to the given thread by this session.
+// A completed-but-unbound answer is load-bearing: the old thread holds a
+// real answer that neither adoption nor auto-resync could bind, so
+// abandoning it silently would lose work — fail closed to 409, never guess.
+func (h *handler) sentCompletedFor(session, url, promptHash string) bool {
+	for i := len(h.sentLog) - 1; i >= 0; i-- {
+		e := h.sentLog[i]
+		if e.Session == session && e.URL == url && e.Event == "completed" && e.PromptHash == promptHash {
+			return true
+		}
+	}
+	for _, e := range h.sentLogTail(300) {
+		if e.Session == session && e.URL == url && e.Event == "completed" && e.PromptHash == promptHash {
+			return true
+		}
+	}
+	return false
+}
+
+// planCleanReseed validates a rewrite reseed for a non-dirty session: the
+// incoming history is a coherent rewrite of committed state, so reseeding
+// fresh with carried executed results is safe. It returns nil for
+// append-only histories (no behavior change) and for incoherent input
+// (legacy fresh replay applies; clean sessions hold no uncertainty).
+func planCleanReseed(s *session, incoming []message) *rewritePlan {
+	if s == nil || s.URL == "" || len(s.Messages) == 0 {
+		return nil
+	}
+	kind, mm := classifyHistoryRewrite(incoming, s.Messages)
+	if kind == "" || kind == rewriteAmbiguous {
+		return nil
+	}
+	carried, carriedIDs, incomplete := carryExecuted(s, nil, incoming)
+	return &rewritePlan{
+		classification: kind,
+		mismatchIndex:  mm.Index,
+		mismatchField:  mm.Field,
+		carried:        carried,
+		carriedIDs:     carriedIDs,
+		notCarried:     incomplete,
+		oldURL:         s.URL,
+	}
+}
+
+// planDirtyReseed validates a rewrite reseed for a dirty session, after
+// adoption and auto-resync have already refused the interrupt shape.
+// Unknown-state items (the still-pending turn) are listed as NOT carried
+// and the old thread is abandoned without delivery — safe because an
+// undelivered answer caused no external execution. It returns nil (caller
+// keeps 409 with sent-log diagnosis) when the shape is not a coherent
+// rewrite, when the pending binding is too incomplete to reason about, or
+// when the unknown item is load-bearing: a verifiable completed answer
+// for the pending prompt exists on the old thread.
+func (h *handler) planDirtyReseed(id string, s *session, incoming []message) *rewritePlan {
+	if s == nil || s.URL == "" {
+		return nil
+	}
+	if !s.Pending || s.PendingPrompt == "" || len(s.PendingMessages) == 0 {
+		return nil
+	}
+	kind, mm := classifyHistoryRewrite(incoming, s.Messages)
+	if kind == "" || kind == rewriteAmbiguous {
+		if mm != nil {
+			log.Printf("[openai] session=%s rewrite-reseed refused: not a coherent rewrite (append or ambiguous); keeping uncertainty", id)
+		}
+		return nil
+	}
+	if s.PendingPrompt != "" && h.sentCompletedFor(id, s.URL, promptHash(s.PendingPrompt)) {
+		log.Printf("[openai] session=%s rewrite-reseed refused: sent-log holds a completed answer for the pending prompt on thread %s that recovery could not bind (load-bearing); keeping uncertainty", id, s.URL)
+		return nil
+	}
+	carried, carriedIDs, incomplete := carryExecuted(s, s.PendingMessages, incoming)
+	plan := &rewritePlan{
+		classification: kind,
+		mismatchIndex:  mm.Index,
+		mismatchField:  mm.Field,
+		carried:        carried,
+		carriedIDs:     carriedIDs,
+		notCarried:     incomplete,
+		oldURL:         s.URL,
+	}
+	if s.PendingPrompt != "" {
+		plan.notCarried = append(plan.notCarried, fmt.Sprintf("pending:%s (outcome unknown; old thread abandoned without delivery, never submitted as pending)", shortHash12(promptHash(s.PendingPrompt))))
+	}
+	return plan
+}
+
+// Prior-execution record delimiters. The carried exchanges travel as inert
+// reviewed history ahead of the rewritten transcript: clearly delimited as
+// a prior-execution record, never re-submitted as pending calls. Every
+// carried message renders through formatForBrowser, which labels tool
+// calls/results as inert history.
+const reseedRecordIntro = "PRIOR EXECUTION RECORD\nThe following completed tool exchanges already executed in the external client before a history rewrite (revert/fork/compaction). They are inert history: do NOT re-request them, do NOT emit opencode_bridge_call wrappers for them. Use their results only as context.\n"
+const reseedRecordEnd = "END PRIOR EXECUTION RECORD\n"
+
+// buildReseedSeed renders one bounded fresh-chat prompt: the tool preamble,
+// then the carried prior-execution record (when any), then the client's
+// rewritten transcript. Single turn: over-budget seeds are rejected with
+// 413 by the shared budget check, never split — so wrappers cannot be cut.
+func buildReseedSeed(sysHead string, incoming []message, plan *rewritePlan) string {
+	var b strings.Builder
+	if sysHead != "" {
+		b.WriteString(sysHead + "\n\n")
+	}
+	if len(plan.carried) > 0 {
+		b.WriteString(reseedRecordIntro)
+		for _, m := range plan.carried {
+			b.WriteString(formatForBrowser(m) + "\n")
+		}
+		b.WriteString(reseedRecordEnd)
+	}
+	for _, m := range incoming {
+		b.WriteString(formatForBrowser(m) + "\n")
+	}
+	return b.String()
+}
+
+// evidence renders the reseed record shared by the journal and the
+// sent-log: rewrite classification, old→new thread linkage, and the
+// carried/not-carried item lists. Structure only: IDs and hashes, never
+// text or argument values.
+func (p *rewritePlan) evidence(newURL string, seedBytes int) string {
+	carried := "[]"
+	if len(p.carriedIDs) > 0 {
+		carried = "[" + strings.Join(p.carriedIDs, ",") + "]"
+	}
+	notCarried := "[]"
+	if len(p.notCarried) > 0 {
+		notCarried = "[" + strings.Join(p.notCarried, ",") + "]"
+	}
+	return fmt.Sprintf("rewrite-reseed %s classification=%s mismatch=%d:%s old=%s new=%s carried=%s not-carried=%s seed=%dB record-first",
+		time.Now().UTC().Format(time.RFC3339), p.classification, p.mismatchIndex, p.mismatchField, p.oldURL, newURL, carried, notCarried, seedBytes)
+}
+
+// note renders the sent-log form of the linkage: old→new thread plus
+// classification and item lists.
+func (p *rewritePlan) note(newURL string) string {
+	carried := "[]"
+	if len(p.carriedIDs) > 0 {
+		carried = "[" + strings.Join(p.carriedIDs, ",") + "]"
+	}
+	notCarried := "[]"
+	if len(p.notCarried) > 0 {
+		notCarried = "[" + strings.Join(p.notCarried, ",") + "]"
+	}
+	return fmt.Sprintf("reseed old=%s new=%s classification=%s carried=%s not-carried=%s", p.oldURL, newURL, p.classification, carried, notCarried)
+}

@@ -1,0 +1,982 @@
+// Package gemini drives gemini.google.com (consumer UI) in a dedicated
+// Chrome profile via CDP so that AI agents can use a Gemini Web session
+// (no API key, no cost) through a plain ask/answer interface.
+//
+// The client owns one Chrome instance (launched on demand with its own
+// profile directory) and one tab. All operations are serialized through a
+// mutex because they share that single tab.
+//
+// Isolation: default profile ~/.gemini-proxy and CDP port 9223 — never the
+// chatgpt bridge's ~/.chatgpt-proxy / 9222. This package never navigates,
+// closes, or inspects tabs owned by another bridge.
+package gemini
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/chromedp/cdproto/emulation"
+	"github.com/chromedp/cdproto/target"
+	"github.com/chromedp/chromedp"
+)
+
+// Defaults.
+const (
+	DefaultChromePort = 9223
+	DefaultTimeout    = 10 * time.Minute
+	// HomePage is the Gemini consumer UI. /app is the direct chat route;
+	// the bare domain redirects there when logged in, to a sign-in
+	// interstitial when not.
+	HomePage = "https://gemini.google.com/app"
+)
+
+// Errors returned by Ask/Status. Callers can use errors.Is to give agents
+// actionable messages.
+var (
+	ErrChromeNotFound      = errors.New("chrome binary not found")
+	ErrChromeLaunch        = errors.New("failed to launch chrome")
+	ErrNotLoggedIn         = errors.New("not logged in to gemini.google.com (run gemini-proxy -wait-login and sign in with Google once)")
+	ErrNoComposer          = errors.New("gemini composer not found")
+	ErrNoResponse          = errors.New("gemini did not produce a response in time")
+	ErrMissingAnswer       = errors.New("Gemini generation ended without an extractable new model answer; inspect the tab and retry; no automatic resubmission")
+	ErrNotSubmitted        = errors.New("turn failed before any submission action")
+	ErrSubmissionUncertain = errors.New("submission action outcome is uncertain; no automatic resubmission")
+)
+
+// IsNavigateError reports a page-navigation failure. All navigate steps run
+// before anything is typed or submitted, so a caller that sees only such an
+// error knows provably that nothing was sent and may safely retry instead of
+// treating the turn as uncertain.
+func IsNavigateError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "navigate:")
+}
+
+// ---------------------------------------------------------------------------
+// Selector inventory (Gemini consumer UI, October 2026).
+//
+// Signed-in Vietnamese DOM verified 2026-10-14: account SignOutOptions,
+// Quill rich-textarea.__quill.getText(), localized send button, response
+// message-content IDs, markdown aria-busy=false and response-footer.complete.
+// English fallbacks remain provisional. Do not blind-retry on selector drift.
+// ---------------------------------------------------------------------------
+
+var (
+	// loginSelectors match the signed-out state: the "Sign in" affordance
+	// on the gemini.google.com interstitial. Must be valid CSS for
+	// querySelector. Live-verified 2026-10-14 (signed-out DOM): both the
+	// link and the button variants exist with aria-label="Sign in".
+	loginSelectors = []string{
+		`a[aria-label*="Sign in"]`,     // sign-in link (verified hit)
+		`button[aria-label="Sign in"]`, // sign-in button (verified in button inventory)
+	}
+	// loginTextJS is the fallback text scan for locales where the sign-in
+	// control carries no aria-label (querySelector can't match text).
+	loginTextJS = `(function(){return Array.from(document.querySelectorAll('a,button')).some(function(el){return /sign in/i.test(el.textContent||'')&&el.offsetParent!==null;});})()`
+	// loggedInSelectors match the signed-in state: the Google-account avatar
+	// (account switcher) present on every logged-in Google surface.
+	loggedInSelectors = []string{
+		`a[href^="https://accounts.google.com/SignOutOptions"]`, // signed-in avatar, locale-independent; verified vi 2026-10-14
+		`a[aria-label^="Google Account"]`,                       // account avatar link ("Google Account: Name <mail>")
+		`img[aria-label*="Google Account"]`,                     // avatar image fallback
+		`div[aria-label*="Google Account"]`,                     // avatar container fallback
+	}
+	// composerSelectors match the prompt box, in priority order. Gemini's
+	// editor is a Quill instance inside the rich-textarea component.
+	// Live-verified 2026-10-14 (signed-out DOM): the editable div carries
+	// aria-label="Enter a prompt for Gemini" and data-placeholder="Ask
+	// Gemini" (the placeholder is NOT the aria-label — first guess wrong).
+	composerSelectors = []string{
+		`div.ql-editor[role="textbox"][contenteditable="true"]`,                         // signed-in Vietnamese Quill, verified 2026-10-14
+		`div.ql-editor[aria-label="Enter a prompt for Gemini"][contenteditable="true"]`, // primary prompt box (verified hit)
+		`rich-textarea div[contenteditable="true"]`,                                     // component-scoped fallback (verified hit)
+		`div.ql-editor[contenteditable="true"]`,                                         // Quill editor fallback (verified hit)
+	}
+	// sendSelectors match the submit button, in priority order.
+	// The localized control appears after a user-source Quill document update.
+	// Signed-out composer presence is not evidence of a functional submit.
+	sendSelectors = []string{
+		`button[aria-label="Gửi tin nhắn"]`, // enabled signed-in vi control, verified after native input 2026-10-14
+		`button[aria-label="Send message"]`, // guessed primary (UNVERIFIED)
+		`button.send-button`,                // class-based fallback (UNVERIFIED)
+	}
+	// newChatSelectors match the "New chat" affordance. Live-verified
+	// 2026-10-14: the LINK variant hits on the signed-out DOM.
+	newChatSelectors = []string{
+		`a[aria-label="New chat"]`,      // link variant (verified hit)
+		`button[aria-label="New chat"]`, // side-nav button variant (unseen signed-out)
+	}
+	// stopSelectors match the "Stop" button shown while generating; its
+	// disappearance marks generation end.
+	stopSelectors = []string{
+		`button[aria-label="Dừng phản hồi"]`,
+		`button[aria-label="Dừng"]`,
+		`button[aria-label="Stop"]`, // stop-generation button
+	}
+	// answerSelectors scope the newest model answer, in priority order.
+	// model-response is Gemini's custom element per turn.
+	answerSelectors = []string{
+		`model-response`,                // per-turn custom element (primary)
+		`div.model-response-text`,       // response text container
+		`div.markdown-container`,        // rendered Markdown container
+		`div[data-message-id*="model"]`, // message-id fallback
+	}
+)
+
+// Status describes the current state of the Gemini Web tab.
+type Status struct {
+	LoggedIn   bool   `json:"logged_in"`
+	Composer   bool   `json:"composer"`
+	NewChat    bool   `json:"new_chat_button"`
+	LoginBtn   bool   `json:"login_button"`
+	URL        string `json:"url"`
+	Title      string `json:"title"`
+	Profile    string `json:"chrome_profile"`
+	ChromePort int    `json:"chrome_port"`
+}
+
+// Client owns the Chrome instance and the shared tab.
+type Client struct {
+	ChromePort int
+	ProfileDir string
+	ChromePath string // optional override; auto-detected when empty
+	Background bool   // run Chrome window in background (off-screen / minimized)
+
+	mu      sync.Mutex
+	life    context.Context // long-lived parent for browser/tab contexts
+	browser context.Context
+	cancel  context.CancelFunc
+	// wsURL is the debugger endpoint the allocator is bound to. A Chrome
+	// restart mints a new endpoint UUID, so it identifies staleness.
+	wsURL           string
+	tab             context.Context
+	tabDone         context.CancelFunc
+	launchAttempted bool
+	launchPort      int
+	actualPort      int
+	ownedTarget     target.ID
+	draftPrompt     string // retained only after a provably unsubmitted insertion
+	draftIdentity   string // adapter session + exact request; never cross-client reuse
+}
+
+// New builds a client with defaults for anything zero-valued.
+func New(port int, profileDir, chromePath string) *Client {
+	if port == 0 {
+		port = DefaultChromePort
+	}
+	if profileDir == "" {
+		dir, err := os.UserHomeDir()
+		if err == nil && dir != "" {
+			profileDir = filepath.Join(dir, ".gemini-proxy")
+		} else {
+			profileDir = ".gemini-proxy"
+		}
+	}
+	return &Client{ChromePort: port, ProfileDir: profileDir, ChromePath: chromePath,
+		life: context.Background()}
+}
+
+// Close shuts down the CDP connection (not the Chrome process — the user's
+// session stays alive in the profile for the next run).
+func (c *Client) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.teardownLocked()
+}
+
+// teardownLocked drops the tab and allocator contexts. Callers must hold c.mu.
+// Nil-safe: double teardown is a no-op.
+func (c *Client) teardownLocked() {
+	if c.ownedTarget != "" {
+		// Only explicit newly-created targets are ours to close. Context
+		// cancellation of an attached target merely detaches its CDP session.
+		client := http.Client{Timeout: 2 * time.Second}
+		if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/close/%s", c.actualPort, c.ownedTarget)); err == nil {
+			resp.Body.Close()
+		}
+		c.ownedTarget = ""
+	}
+	if c.tabDone != nil {
+		c.tabDone()
+		c.tabDone = nil
+	}
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
+	c.tab = nil
+	c.browser = nil
+	c.wsURL = ""
+	c.draftPrompt = ""
+	c.draftIdentity = ""
+}
+
+// tabAlive exercises the full CDP chain (tab session -> allocator websocket)
+// with a trivial read, so a silently dropped connection is rebuilt instead
+// of failing every later Run.
+func (c *Client) tabAlive() bool {
+	if c.tab == nil || c.browser == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(c.tab, 5*time.Second)
+	defer cancel()
+	var url string
+	if err := chromedp.Run(ctx, chromedp.Location(&url)); err != nil {
+		return false
+	}
+	return true
+}
+
+// portFree reports whether localhost:port accepts no TCP connection.
+func portFree(port int) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 300*time.Millisecond)
+	if err != nil {
+		return true
+	}
+	conn.Close()
+	return false
+}
+
+// chromeBinary resolves the Chrome executable: explicit override, then the
+// usual macOS / Linux / Windows locations, then PATH.
+func chromeBinary(override string) (string, error) {
+	if override != "" {
+		return override, nil
+	}
+	candidates := []string{
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/Applications/Chromium.app/Contents/MacOS/Chromium",
+		"/usr/bin/google-chrome",
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
+		"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	if p, err := exec.LookPath("google-chrome"); err == nil {
+		return p, nil
+	}
+	if p, err := exec.LookPath("chrome"); err == nil {
+		return p, nil
+	}
+	if p, err := exec.LookPath("chromium"); err == nil {
+		return p, nil
+	}
+	return "", ErrChromeNotFound
+}
+
+// ensureBrowserLocked attaches to (or launches) Chrome and prepares OUR OWN
+// dedicated tab on the Gemini page. Callers must hold c.mu.
+//
+// Lifecycle (mirrors chatgpt-proxy's proven shape):
+//  1. attach to an already-running debugger on the isolated port, else launch
+//     headless/visible Chrome with the isolated profile;
+//  2. create our tab through the DevTools HTTP API (/json/new) — reliable
+//     even when no window exists yet, unlike Target.createTarget over the
+//     websocket ("no browser is open");
+//  3. attach the CDP session to that explicit target ID and verify it with a
+//     no-op Run before trusting it.
+//
+// A connection blip during a fresh launch makes chromedp cancel the whole tab
+// context (its LostConnection handler cancels the tab root, so every later
+// Run fails instantly with "context canceled" while the browser stays alive).
+// Hence the verify step plus retry-until-deadline: a dead first build is
+// torn down and rebuilt, never cached.
+func (c *Client) ensureBrowserLocked(ctx context.Context) error {
+	if c.tabAlive() {
+		return nil
+	}
+	c.teardownLocked()
+
+	deadline := time.Now().Add(60 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if err := c.tryEnsureLocked(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		c.teardownLocked()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("unknown browser setup failure")
+	}
+	return lastErr
+}
+
+// tryEnsureLocked performs one attach-or-launch + own-tab + verify pass.
+// Callers must hold c.mu. On any failure the caller tears down and retries.
+func (c *Client) tryEnsureLocked(ctx context.Context) error {
+	// 1. Debugger endpoint: attach to ours if already up, else launch.
+	port := c.ChromePort
+	if !c.debuggerUp(port) {
+		if !portFree(port) {
+			return errors.New("configured Chrome port is occupied; refusing another port")
+		}
+		if err := c.launchLocked(ctx, port); err != nil {
+			return err
+		}
+	} else {
+		log.Printf("[gemini] attaching to existing debugger on %d", port)
+	}
+	wsURL, err := c.waitDebugger(port, 20*time.Second)
+	if err != nil {
+		return err
+	}
+	if err := verifyProfile(port, c.ProfileDir); err != nil {
+		return err
+	}
+	allocCtx, cancel := chromedp.NewRemoteAllocator(c.life, wsURL)
+	c.browser = allocCtx
+	c.cancel = cancel
+	c.wsURL = wsURL
+	c.actualPort = port
+
+	// 2. Our OWN tab via DevTools HTTP (never adopt another bridge's tab:
+	//    Phase 1 always mints a dedicated target on OUR debugger).
+	tid, err := c.createOwnTab(port)
+	if err != nil {
+		return err
+	}
+	log.Printf("[gemini] created own tab %s on %d", tid, port)
+	c.ownedTarget = tid
+
+	// 3. Attach to the explicit target and verify the session is live.
+	// CRITICAL: the FIRST Run on a new tab context must use the tab context
+	// itself, never a timeout child. chromedp's allocator binds its lifetime
+	// watcher to the first Run's context: cancelling that context (e.g. via
+	// defer on a timeout child at function return) makes the watcher call
+	// Cancel on the SHARED tab root — every later Run then fails instantly
+	// with "context canceled" and the target is closed. The tab root lives
+	// until teardown, so verifying on it is safe; the caller's context still
+	// bounds the public call.
+	tab, done := chromedp.NewContext(c.browser, chromedp.WithTargetID(tid))
+	if err := chromedp.Run(tab, chromedp.ActionFunc(func(context.Context) error { return nil })); err != nil {
+		done()
+		return fmt.Errorf("tab verify: %w", err)
+	}
+	c.tab = tab
+	c.tabDone = done
+	log.Printf("[gemini] tab %s verified; navigating to %s", tid, HomePage)
+
+	// 4. Load the Gemini page in OUR tab (navigating our own target only),
+	// then actively poll for settle. A blind Sleep leaves the tab's
+	// websocket idle while headless software rendering pegs the renderer;
+	// chromedp reads that as a lost connection and cancels the whole tab
+	// context (every later Run then fails with "context canceled" and the
+	// target is closed). Polling keeps the websocket warm and adapts the
+	// wait to the real load.
+	nav, cancelNav := context.WithTimeout(c.tab, 90*time.Second)
+	defer cancelNav()
+	if err := chromedp.Run(nav, chromedp.Navigate(HomePage)); err != nil {
+		return fmt.Errorf("navigate: %w", err)
+	}
+	if err := c.pollPageSettledLocked(nav); err != nil {
+		return err
+	}
+	log.Printf("[gemini] tab %s settled at %s (tab.Err=%v)", tid, HomePage, c.tab.Err())
+	return nil
+}
+
+// pollPageSettledLocked waits (actively) until the page reports
+// readyState==complete with a non-empty title, up to ~30s. Each poll is a
+// real CDP round-trip, keeping the tab websocket warm while heavy JS loads.
+// Callers must hold c.mu.
+func (c *Client) pollPageSettledLocked(ctx context.Context) error {
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		var ready, title string
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		errReady := chromedp.Run(rctx, chromedp.Evaluate(`document.readyState`, &ready))
+		errTitle := chromedp.Run(rctx, chromedp.Evaluate(`document.title`, &title))
+		cancel()
+		if errReady == nil && errTitle == nil && ready == "complete" && strings.TrimSpace(title) != "" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return errors.New("page did not settle after navigation")
+}
+
+// debuggerUp reports whether the DevTools /json/version endpoint answers.
+func (c *Client) debuggerUp(port int) bool {
+	_, err := c.debuggerWSURL(port)
+	return err == nil
+}
+
+// debuggerWSURL fetches the browser websocket URL from /json/version.
+func (c *Client) debuggerWSURL(port int) (string, error) {
+	client := http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var v struct {
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return "", err
+	}
+	if v.WebSocketDebuggerURL == "" {
+		return "", errors.New("empty debugger url")
+	}
+	return v.WebSocketDebuggerURL, nil
+}
+
+// waitDebugger polls /json/version until it answers or timeout.
+func (c *Client) waitDebugger(port int, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if wsURL, err := c.debuggerWSURL(port); err == nil {
+			return wsURL, nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return "", fmt.Errorf("debugging port %d never came up", port)
+}
+
+// launchLocked starts Chrome with the isolated profile on the given free
+// port. Callers must hold c.mu.
+func (c *Client) launchLocked(ctx context.Context, port int) error {
+	bin, err := chromeBinary(c.ChromePath)
+	if err != nil {
+		return err
+	}
+	args := []string{
+		bin,
+		fmt.Sprintf("--remote-debugging-port=%d", port),
+		"--no-first-run",
+		"--no-default-browser-check",
+		fmt.Sprintf("--user-data-dir=%s", c.ProfileDir),
+		"about:blank",
+	}
+	if c.Background {
+		args = append(args, "--headless=new")
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("%w: %v", ErrChromeLaunch, err)
+	}
+	go func() { _ = cmd.Wait() }()
+	c.launchAttempted = true
+	c.launchPort = port
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
+
+// createOwnTab mints a dedicated page target via the DevTools HTTP API.
+func (c *Client) createOwnTab(port int) (target.ID, error) {
+	client := http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodPut,
+		fmt.Sprintf("http://127.0.0.1:%d/json/new?%s", port, HomePage), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("create tab: %w", err)
+	}
+	defer resp.Body.Close()
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		return "", fmt.Errorf("create tab: %w", err)
+	}
+	if created.ID == "" {
+		return "", errors.New("empty target id from /json/new")
+	}
+	return target.ID(created.ID), nil
+}
+
+// jsBool runs a JS expression expected to yield a boolean.
+func (c *Client) jsBool(ctx context.Context, expr string) bool {
+	var out bool
+	_ = chromedp.Run(ctx, chromedp.Evaluate(expr, &out))
+	return out
+}
+
+// jsString runs a JS expression expected to yield a string.
+func (c *Client) jsString(ctx context.Context, expr string) string {
+	var out string
+	_ = chromedp.Run(ctx, chromedp.Evaluate(expr, &out))
+	return out
+}
+
+// signInPresent reports whether a visible sign-in affordance exists
+// (aria-label selector hit OR visible link/button text scan).
+func (c *Client) signInPresent(ctx context.Context) bool {
+	if c.anyPresent(ctx, loginSelectors) {
+		return true
+	}
+	return c.jsBool(ctx, loginTextJS)
+}
+
+// anyPresent reports whether any selector in the list matches at least one
+// node in the page.
+func (c *Client) anyPresent(ctx context.Context, selectors []string) bool {
+	for _, sel := range selectors {
+		if c.jsBool(ctx, fmt.Sprintf(`!!document.querySelector(%q)`, sel)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isStaleErr reports transport-level failures that mean the tab session is
+// dead (not a page problem): the caller should rebuild and retry. It must
+// NEVER match page-level states (not-logged-in, no-composer, no-answer) —
+// those are answers, not transport faults.
+func isStaleErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "websocket") ||
+		strings.Contains(msg, "lost connection") ||
+		strings.Contains(msg, "target closed") ||
+		strings.Contains(msg, "no such target")
+}
+
+// LoginState attaches (read-only) and reports the signed-in state without
+// typing or navigating away from the current page. Transport blips rebuild
+// the tab transparently (bounded); page states are returned as-is.
+func (c *Client) LoginState(ctx context.Context) (*Status, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		st, err := c.loginStateOnce(ctx)
+		if err == nil {
+			return st, nil
+		}
+		lastErr = err
+		if !isStaleErr(err) {
+			return nil, err
+		}
+		c.mu.Lock()
+		c.teardownLocked()
+		c.mu.Unlock()
+		log.Printf("[gemini] stale tab during LoginState (attempt %d): %v; rebuilding", attempt+1, err)
+	}
+	return nil, lastErr
+}
+
+func (c *Client) loginStateOnce(ctx context.Context) (*Status, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ensureBrowserLocked(ctx); err != nil {
+		return nil, err
+	}
+	rctx, cancel := operationContext(c.tab, ctx, 30*time.Second)
+	defer cancel()
+	st := &Status{Profile: c.ProfileDir, ChromePort: c.actualPort}
+	var url, title string
+	if err := chromedp.Run(rctx, chromedp.Location(&url)); err != nil {
+		return nil, err
+	}
+	if err := chromedp.Run(rctx, chromedp.Title(&title)); err != nil {
+		return nil, err
+	}
+	st.URL, st.Title = url, title
+	st.LoginBtn = c.signInPresent(rctx)
+	st.LoggedIn = c.anyPresent(rctx, loggedInSelectors) && !st.LoginBtn
+	// A generic Google-account avatar also counts (some locales render the
+	// switcher without the exact "Google Account" prefix).
+	if !st.LoggedIn {
+		st.LoggedIn = c.jsBool(rctx, `!!document.querySelector('a[aria-label*="Account"]') && !document.querySelector('a[aria-label*="Sign in"]')`)
+	}
+	st.Composer = c.anyPresent(rctx, composerSelectors)
+	st.NewChat = c.anyPresent(rctx, newChatSelectors)
+	return st, nil
+}
+
+// CurrentURL reports the owned tab's current URL without typing,
+// submitting, or navigating. Read-only probe for the adapter's sent-log
+// thread linkage. "" means the browser was unreachable, never evidence
+// about thread state.
+func (c *Client) CurrentURL(ctx context.Context) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ensureBrowserLocked(ctx); err != nil {
+		return ""
+	}
+	rctx, cancel := operationContext(c.tab, ctx, 10*time.Second)
+	defer cancel()
+	var url string
+	if err := chromedp.Run(rctx, chromedp.Location(&url)); err != nil {
+		return ""
+	}
+	return url
+}
+
+// Status attaches (or launches) and reports the full tab state.
+func (c *Client) Status(ctx context.Context) (*Status, error) {
+	return c.LoginState(ctx)
+}
+
+// Ask sends prompt to Gemini Web and returns the answer as Markdown.
+// When newSession is true it starts a fresh chat first; otherwise it
+// continues the current conversation.
+func (c *Client) Ask(ctx context.Context, prompt string, newSession bool, timeout time.Duration) (string, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return "", errors.New("prompt must not be empty")
+	}
+	if timeout <= 0 || timeout > 30*time.Minute {
+		timeout = DefaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Pre-submission phase (bounded retry): ensure, auth gate, new chat.
+	// Retries here are provably safe — nothing is typed or submitted yet,
+	// so a transport blip rebuilds instead of risking a double submit.
+	var beforeIDs map[string]bool
+	submissionReady := false
+	var lastErr error
+	for attempt := 0; attempt < 2 && !submissionReady; attempt++ {
+		c.mu.Lock()
+		pendingDraft := c.draftPrompt
+		pendingIdentity := c.draftIdentity
+		c.mu.Unlock()
+		identity, _ := ctx.Value(turnIdentityKey{}).(string)
+		if pendingDraft != "" && (pendingDraft != prompt || pendingIdentity != identity) {
+			return "", fmt.Errorf("%w: another owned draft requires reconciliation; refusing to replace it", ErrNotSubmitted)
+		}
+		if err := c.prepareTurn(ctx, newSession && pendingDraft == ""); err != nil {
+			lastErr = err
+			if ctx.Err() != nil {
+				return "", fmt.Errorf("%w: prepare canceled: %v", ErrNotSubmitted, ctx.Err())
+			}
+			if errors.Is(err, ErrNotLoggedIn) {
+				return "", err // page state, not transport: never churn on this
+			}
+			if !isStaleErr(err) && !IsNavigateError(err) && !errors.Is(err, ErrNotSubmitted) {
+				return "", fmt.Errorf("%w: prepare: %v", ErrNotSubmitted, err)
+			}
+			c.mu.Lock()
+			c.teardownLocked()
+			c.mu.Unlock()
+			log.Printf("[gemini] pre-submission blip (attempt %d): %v; rebuilding", attempt+1, err)
+			continue
+		}
+		c.mu.Lock()
+		var err error
+		beforeIDs, err = c.modelMessageIDsLocked(ctx)
+		c.mu.Unlock()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		submissionReady = true
+	}
+	if !submissionReady {
+		if lastErr == nil {
+			lastErr = errors.New("could not prepare turn")
+		}
+		return "", fmt.Errorf("%w: prepare: %v", ErrNotSubmitted, lastErr)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.typeAndSubmitLocked(ctx, prompt); err != nil {
+		return "", err
+	}
+	html, err := c.waitForAnswerLocked(ctx, beforeIDs)
+	if err != nil {
+		return "", err
+	}
+	text := ConvertResponseHTML(html)
+	if strings.TrimSpace(text) == "" {
+		return "", ErrMissingAnswer
+	}
+	return text, nil
+}
+
+// prepareTurn ensures the browser, enforces the auth gate, and starts
+// a fresh chat when asked. It never types or submits: safe to retry.
+// It locks internally per step; callers must not hold c.mu.
+func (c *Client) prepareTurn(ctx context.Context, newSession bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: prepare canceled: %v", ErrNotSubmitted, err)
+	}
+	if err := c.ensureBrowserLocked(ctx); err != nil {
+		return err
+	}
+
+	// Fail closed on auth: never attempt to bypass Google sign-in.
+	loggedIn, err := c.checkLoggedInLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if !loggedIn {
+		return ErrNotLoggedIn
+	}
+
+	if newSession {
+		if err := c.newChatLocked(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkLoggedInLocked reports the signed-in state. Callers must hold c.mu.
+func (c *Client) checkLoggedInLocked(ctx context.Context) (bool, error) {
+	rctx, cancel := operationContext(c.tab, ctx, 30*time.Second)
+	defer cancel()
+	if c.signInPresent(rctx) {
+		return false, nil
+	}
+	if c.anyPresent(rctx, loggedInSelectors) {
+		return true, nil
+	}
+	if err := rctx.Err(); err != nil {
+		return false, fmt.Errorf("%w: login check interrupted: %v", ErrNotSubmitted, err)
+	}
+	// No sign-in evidence above, but a composer alone does NOT prove login:
+	// the signed-out page renders one too (live-verified 2026-10-14). Only
+	// the account avatar proves it — otherwise fail closed.
+	return false, nil
+}
+
+// newChatLocked starts a fresh Gemini conversation. Callers must hold c.mu.
+func (c *Client) newChatLocked(ctx context.Context) error {
+	rctx, cancel := operationContext(c.tab, ctx, 30*time.Second)
+	defer cancel()
+	for _, sel := range newChatSelectors {
+		clicked := false
+		_ = chromedp.Run(rctx, chromedp.Evaluate(fmt.Sprintf(
+			`(function(){var el=document.querySelector(%q);if(!el)return false;el.click();return true;})()`, sel), &clicked))
+		if clicked {
+			_ = chromedp.Run(rctx, chromedp.Sleep(2*time.Second))
+			return nil
+		}
+	}
+	// Fallback: direct navigation to a fresh /app URL starts a new chat.
+	// This navigates OUR OWN dedicated tab only.
+	nctx, cancel2 := operationContext(c.tab, ctx, 30*time.Second)
+	defer cancel2()
+	if err := chromedp.Run(nctx,
+		chromedp.Navigate(HomePage),
+		chromedp.Sleep(3*time.Second),
+	); err != nil {
+		return fmt.Errorf("navigate: %w", err)
+	}
+	return nil
+}
+
+// modelMessageIDsLocked snapshots the current set of model-response nodes so
+// the poller can identify the NEW answer. Callers must hold c.mu.
+func (c *Client) modelMessageIDsLocked(ctx context.Context) (map[string]bool, error) {
+	rctx, cancel := operationContext(c.tab, ctx, 15*time.Second)
+	defer cancel()
+	var values []string
+	if err := chromedp.Run(rctx, chromedp.Evaluate(
+		`Array.from(document.querySelectorAll('model-response message-content[id]')).map(e=>e.id)`, &values)); err != nil {
+		return nil, err
+	}
+	ids := make(map[string]bool, len(values))
+	for _, id := range values {
+		ids[id] = true
+	}
+	return ids, nil
+}
+
+// operationContext cancels a tab-scoped operation on either the caller's
+// cancellation or the local stage budget, without canceling the tab root.
+func operationContext(tab, caller context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(tab, budget)
+	stop := context.AfterFunc(caller, cancel)
+	if caller.Err() != nil {
+		cancel()
+	}
+	return ctx, func() { stop(); cancel() }
+}
+
+type turnIdentityKey struct{}
+
+// WithTurnIdentity binds an adapter retry to both its session and exact request.
+// Plain MCP Ask calls retain their existing single-consumer behavior.
+func WithTurnIdentity(ctx context.Context, identity string) context.Context {
+	return context.WithValue(ctx, turnIdentityKey{}, identity)
+}
+
+// fillComposerJS updates the genuine Quill document, not DOM textContent.
+// Native Input.insertText triggers extremely slow per-line editor mutation on
+// large catalogs. Quill's user-source update notifies the app in one batch.
+// Always append a structural newline, even when the prompt already ends in one.
+func fillComposerJS(composer, prompt string) string {
+	return fmt.Sprintf(`(function(){
+var el=document.querySelector(%q), host=el&&el.closest('rich-textarea'), q=host&&host.__quill;
+if(!q||typeof q.setText!=='function'||typeof q.getText!=='function')return 'no-quill';
+var text=%s, expected=text+'\n', current=q.getText();
+if(current===expected&&q.__geminiProxyDraft===text)return 'reused';
+if(current!=='\n')return 'foreign-draft';
+q.__geminiProxyDraft=text;
+q.setText(expected,'user');
+return q.getText()===expected?'inserted':'identity-mismatch';
+})()`, composer, jsQuote(prompt))
+}
+
+// typeAndSubmitLocked fills, verifies, then separately clicks Send. Insertion
+// never submits, even if its CDP reply arrives after cancellation. A retry can
+// reuse only the exact document bearing our ownership marker; no blind clears.
+func (c *Client) typeAndSubmitLocked(ctx context.Context, prompt string) error {
+	rctx, cancel := operationContext(c.tab, ctx, 60*time.Second)
+	defer cancel()
+	// Gemini code-block reveal animations can remain pending in a hidden tab.
+	// Emulate focus only on our target: do not steal OS keyboard focus from
+	// the user's terminal (which could otherwise contaminate the composer).
+	if err := chromedp.Run(rctx, emulation.SetFocusEmulationEnabled(true)); err != nil {
+		return fmt.Errorf("%w: emulate owned-tab focus: %v", ErrNotSubmitted, err)
+	}
+
+	composer := ""
+	for _, sel := range composerSelectors {
+		if c.jsBool(rctx, fmt.Sprintf(`!!document.querySelector(%q)`, sel)) {
+			composer = sel
+			break
+		}
+	}
+	if composer == "" {
+		return ErrNoComposer
+	}
+
+	c.draftPrompt = prompt
+	c.draftIdentity, _ = ctx.Value(turnIdentityKey{}).(string)
+	started := time.Now()
+	var filled string
+	if err := chromedp.Run(rctx, chromedp.Evaluate(fillComposerJS(composer, prompt), &filled)); err != nil {
+		return fmt.Errorf("%w: Quill input failed (%d bytes, %s): %v", ErrNotSubmitted, len(prompt), time.Since(started).Round(time.Millisecond), err)
+	}
+	log.Printf("[gemini] input bytes=%d stage=quill duration=%s result=%s", len(prompt), time.Since(started).Round(time.Millisecond), filled)
+	if filled != "inserted" && filled != "reused" {
+		return fmt.Errorf("%w: Quill input refused: %s", ErrNotSubmitted, filled)
+	}
+
+	// Verify exact Quill document identity, including its structural newline.
+	var holds bool
+	_ = chromedp.Run(rctx, chromedp.Evaluate(fmt.Sprintf(
+		`(function(){var el=document.querySelector(%q);if(!el)return false;var host=el.closest('rich-textarea');var q=host&&host.__quill;return !!q&&q.getText()===%s+'\n';})()`,
+		composer, jsQuote(prompt)), &holds))
+	if !holds {
+		return fmt.Errorf("%w: composer verification failed, refusing to submit", ErrNotSubmitted)
+	}
+
+	for _, sel := range sendSelectors {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: canceled before Send: %v", ErrNotSubmitted, err)
+		}
+		if !c.jsBool(rctx, fmt.Sprintf(`(function(){var e=document.querySelector(%q);return !!e&&!e.disabled&&e.getAttribute('aria-disabled')!=='true';})()`, sel)) {
+			continue
+		}
+		var clicked bool
+		err := chromedp.Run(rctx, chromedp.Evaluate(fmt.Sprintf(
+			`(function(){var e=document.querySelector(%q),h=e&&e.closest('rich-textarea'),q=h&&h.__quill;var el=document.querySelector(%q);if(!q||q.__geminiProxyDraft!==%s||q.getText()!==%s+'\n'||!el||el.disabled||el.getAttribute('aria-disabled')==='true')return false;el.click();return true;})()`, composer, sel, jsQuote(prompt), jsQuote(prompt)), &clicked))
+		if err != nil {
+			c.draftPrompt = "" // click may have happened; never reconcile/retry it
+			c.draftIdentity = ""
+			return fmt.Errorf("%w: %v", ErrSubmissionUncertain, err)
+		}
+		if clicked {
+			c.draftPrompt = ""
+			c.draftIdentity = ""
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: no enabled send control", ErrNotSubmitted)
+}
+
+// waitForAnswerLocked polls until generation finishes and returns the newest
+// model-response outerHTML. Callers must hold c.mu.
+func (c *Client) waitForAnswerLocked(ctx context.Context, before map[string]bool) (string, error) {
+	ticker := time.NewTicker(1500 * time.Millisecond)
+	defer ticker.Stop()
+	var lastStable string
+	stableRounds := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("%w: %v", ErrNoResponse, ctx.Err())
+		case <-ticker.C:
+			rctx, cancel := operationContext(c.tab, ctx, 15*time.Second)
+			generating := c.anyPresent(rctx, stopSelectors)
+			id := c.jsString(rctx, `(function(){var n=document.querySelectorAll('model-response message-content[id]');return n.length?n[n.length-1].id:'';})()`)
+			html := c.jsString(rctx, newestModelResponseJS)
+			cancel()
+			if html == "" || generating || id == "" || before[id] {
+				stableRounds = 0
+				lastStable = html
+				continue
+			}
+			if html == lastStable {
+				stableRounds++
+			} else {
+				stableRounds = 0
+				lastStable = html
+			}
+			// New content, stable across 3 polls (~4.5s) with no stop
+			// button: generation is done. The before-set guards against
+			// adopting a stale answer when nothing new rendered.
+			if stableRounds >= 3 {
+				// Rendering grace: one extra beat for late Markdown paint.
+				select {
+				case <-ctx.Done():
+					return "", fmt.Errorf("%w: %v", ErrNoResponse, ctx.Err())
+				case <-time.After(2 * time.Second):
+				}
+				return html, nil
+			}
+		}
+	}
+}
+
+// newestModelResponseJS returns the outerHTML of the last model-response
+// element (or its fallback containers), or "" when none exists.
+const newestModelResponseJS = `(function(){
+  var nodes=document.querySelectorAll('model-response');
+  if(nodes.length){var n=nodes[nodes.length-1];var body=n.querySelector('message-content .markdown');
+    if(body && body.getAttribute('aria-busy')!=='true' && n.querySelector('.response-footer.complete')){
+      var clean=body.cloneNode(true);
+      clean.querySelectorAll('.code-block-decoration,button,[role="toolbar"]').forEach(e=>e.remove());
+      return clean.outerHTML;}}
+  return '';
+})()`
+
+// jsQuote renders s as a JS string literal (JSON encoding is valid JS).
+func jsQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}

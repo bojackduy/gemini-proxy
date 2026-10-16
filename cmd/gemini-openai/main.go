@@ -1,0 +1,924 @@
+// gemini-openai translates Gemini Web replies into OpenAI chat completions.
+//
+// Minimal Phase-1 adapter: stateful sessions (X-Session-Id affinity),
+// non-streaming JSON plus buffered SSE, and the exact <opencode_bridge_call>
+// tool protocol from chatgpt-proxy so the plugin treats both engines
+// identically. Buffered SSE means errors before validation are HTTP JSON
+// errors, never partial streams.
+//
+// Stateful thread architecture (thread = context): Gemini's server keeps the
+// conversation. Continuation sends only new messages (delta) when the incoming
+// history extends the stored canonical prefix; divergent history starts a new
+// chat and replays the history as one bounded turn (per-turn cap -max-chars;
+// chunked multi-turn replay is a Phase-2 gap — see README/report).
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/bojackduy/gemini-proxy/internal/gemini"
+	"github.com/santhosh-tekuri/jsonschema/v6"
+)
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	addr := flag.String("addr", "127.0.0.1:8789", "listen address")
+	port := flag.Int("chrome-port", gemini.DefaultChromePort, "Chrome debugging port")
+	profile := flag.String("profile", defaultProfile(), "Chrome profile")
+	chrome := flag.String("chrome", "", "Chrome binary")
+	background := flag.Bool("background", false, "minimize Chrome")
+	model := flag.String("model", "gemini-web", "model ID")
+	maxChars := flag.Int("max-chars", 200000, "maximum bytes per Gemini turn")
+	state := flag.String("state", filepath.Join(defaultProfile(), "openai-sessions.json"), "persistent session state")
+	flag.Parse()
+
+	cg := gemini.New(*port, *profile, *chrome)
+	cg.Background = *background
+	defer cg.Close()
+	h := &handler{client: cg, model: *model, maxChars: *maxChars, statePath: *state, profileDir: *profile, gate: make(chan struct{}, 1)}
+	h.gate <- struct{}{}
+	if err := h.load(); err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	srv := &http.Server{Addr: *addr, Handler: h.routes(), ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+	log.Printf("[openai] listening=%s model=%s state=%s chrome_port=%d", *addr, *model, *state, *port)
+	log.Print("[openai] REPAIR: sign in in ~/.gemini-proxy Chrome; CDP: localhost:9223/json/version; DOM selectors: internal/gemini/gemini.go")
+	err := srv.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func defaultProfile() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".gemini-proxy")
+}
+
+// --- wire types (OpenAI-compatible subset) ------------------------------------
+
+type toolFunction struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parameters  any    `json:"parameters"`
+}
+type toolDef struct {
+	Type     string       `json:"type"`
+	Function toolFunction `json:"function"`
+}
+type callFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+type toolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function callFunction `json:"function"`
+}
+type message struct {
+	Role       string     `json:"role"`
+	Content    any        `json:"content"`
+	Name       string     `json:"name,omitempty"`
+	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+type chatRequest struct {
+	Model       string    `json:"model"`
+	Messages    []message `json:"messages"`
+	Tools       []toolDef `json:"tools,omitempty"`
+	ToolChoice  any       `json:"tool_choice,omitempty"`
+	Stream      bool      `json:"stream,omitempty"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Temperature *float64  `json:"temperature,omitempty"`
+}
+
+// --- session state ------------------------------------------------------------
+
+// session stores one client's thread: canonical history prefix (what Gemini
+// has already seen), the last answer, and the last completion identity for
+// exact-retry duplicate-cache.
+type session struct {
+	Pending      bool      `json:"pending,omitempty"`
+	Messages     []message `json:"messages"`
+	LastAnswer   string    `json:"last_answer,omitempty"`
+	LastReqHash  string    `json:"last_req_hash,omitempty"`
+	LastRespID   string    `json:"last_resp_id,omitempty"`
+	LastCreated  int64     `json:"last_created,omitempty"`
+	LastToolIDs  []string  `json:"last_tool_ids,omitempty"`
+	NewSessionAt int64     `json:"new_session_at"`
+	// URL is the owned Gemini chat/thread URL submissions went to. It
+	// ties sent-log entries and future recovery reads to the thread.
+	URL string `json:"url,omitempty"`
+	// PendingPrompt is the exact prompt bytes of the uncertain
+	// submission. Its promptHash is the lineage key the sent-log
+	// diagnosis and any future adoption comparison use.
+	PendingPrompt string `json:"pending_prompt,omitempty"`
+	// PendingMessages/Tools/Choice/ReqHash bind the uncertain turn to
+	// its exact original request, so recovery can validate a thread
+	// answer against the pending (not current) schemas and resume the
+	// exact-retry duplicate cache after a transplant.
+	PendingMessages []message `json:"pending_messages,omitempty"`
+	PendingTools    []toolDef `json:"pending_tools,omitempty"`
+	PendingChoice   any       `json:"pending_choice,omitempty"`
+	PendingReqHash  string    `json:"pending_req_hash,omitempty"`
+	// AutoResyncEvidence records a hash-lineage auto-resync transplant:
+	// what was transplanted, from which thread, and why it was deemed
+	// safe. Persisted so the evidence survives adapter restart.
+	AutoResyncEvidence string `json:"auto_resync_evidence,omitempty"`
+	// ReseedFrom/ReseedEvidence record a history-rewrite reseed: the
+	// abandoned thread and the classification + carried/dropped lists.
+	// Persisted so the linkage survives adapter restart.
+	ReseedFrom     string `json:"reseed_from,omitempty"`
+	ReseedEvidence string `json:"reseed_evidence,omitempty"`
+}
+
+// browserClient is the browser surface the adapter drives: submission plus
+// the read-only recovery readers. *gemini.Client satisfies it; tests inject
+// fakes. Recovery readers never type, submit, navigate, or close tabs.
+type browserClient interface {
+	Ask(ctx context.Context, prompt string, newSession bool, timeout time.Duration) (string, error)
+	CurrentURL(ctx context.Context) string
+	LoginState(ctx context.Context) (*gemini.Status, error)
+	ReadThreadTurn(ctx context.Context, url, prompt string) (gemini.TurnResult, error)
+	ReadLatestThreadTurn(ctx context.Context, url string) (string, gemini.TurnResult, error)
+}
+
+type handler struct {
+	client     browserClient
+	model      string
+	maxChars   int
+	statePath  string
+	profileDir string
+
+	mu       sync.Mutex // guards sessions + persistence
+	sessions map[string]*session
+
+	// sentLog is the bounded in-memory ring of the append-only sent-log
+	// (cmd/gemini-openai/sentlog.go). The file is the durable record;
+	// diagnosis falls back to its tail after a restart.
+	sentLog []sentEntry
+
+	// adoptWait bounds Dirty-path recovery polling; zero means the 90s
+	// production default. Tests shrink it for fast ambiguous cases.
+	adoptWait time.Duration
+
+	gate      chan struct{} // whole-turn serial gate (Phase 1: strictly serial)
+	activeSID string
+	hasActive bool
+}
+
+func (h *handler) load() error {
+	h.sessions = map[string]*session{}
+	raw, err := os.ReadFile(h.statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw, &h.sessions)
+}
+
+// saveLocked persists sessions atomically (write temp + rename, mode 0600).
+// Callers must hold h.mu.
+func (h *handler) saveLocked() {
+	raw, err := json.Marshal(h.sessions)
+	if err != nil {
+		log.Printf("[openai] save marshal: %v", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(h.statePath), 0o700); err != nil {
+		log.Printf("[openai] save mkdir: %v", err)
+		return
+	}
+	tmp := h.statePath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		log.Printf("[openai] save write: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, h.statePath); err != nil {
+		log.Printf("[openai] save rename: %v", err)
+		return
+	}
+}
+
+// --- routes --------------------------------------------------------------------
+
+func (h *handler) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	// /readyz probes the tab WITHOUT navigating: logged-in + composer
+	// present. 503 while the page hydrates or the user is signed out.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		// Do not wait behind a browser turn and misreport its deadline as auth
+		// failure. Readiness is a probe, never a competing browser operation.
+		select {
+		case <-h.gate:
+			defer func() { h.gate <- struct{}{} }()
+		default:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ready": false, "detail": "browser turn busy"})
+			return
+		}
+		h.mu.Lock()
+		pending := false
+		for _, s := range h.sessions {
+			pending = pending || s.Pending
+		}
+		h.mu.Unlock()
+		if pending {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ready": false, "detail": "pending uncertain turn; inspect owned chat"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		st, err := h.client.LoginState(ctx)
+		if err != nil || !st.LoggedIn || !st.Composer {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			detail := "not ready"
+			if err != nil {
+				detail = err.Error()
+			} else if !st.LoggedIn {
+				detail = "not logged in to gemini.google.com"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ready": false, "detail": detail})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ready": true})
+	})
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data": []map[string]any{{
+				"id": h.model, "object": "model",
+				"created": time.Now().Unix(), "owned_by": "gemini-web",
+			}},
+		})
+	})
+	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
+	return mux
+}
+
+// currentThreadURL is a best-effort read-only probe of the owned tab's URL
+// for sent-log thread linkage. It never types, submits, or navigates;
+// "" means the browser was unreachable, not that no thread exists.
+func (h *handler) currentThreadURL(ctx context.Context) string {
+	if h.client == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return h.client.CurrentURL(ctx)
+}
+
+// sessionID resolves client identity: X-Session-Id, x-opencode-session, or
+// x-session-affinity (that priority order). Empty means isolated fresh chat.
+func sessionID(r *http.Request) string {
+	for _, k := range []string{"X-Session-Id", "X-Opencode-Session", "X-Session-Affinity"} {
+		if v := strings.TrimSpace(r.Header.Get(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func reqHash(req *chatRequest) string {
+	raw, _ := json.Marshal(req)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func textOf(m message) string {
+	switch c := m.Content.(type) {
+	case string:
+		return c
+	case nil:
+		return ""
+	default:
+		// SDK text-part arrays: concatenate text parts, ignore media here
+		// (Phase 1 is text-only; media parts are rejected below).
+		raw, _ := json.Marshal(c)
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &parts); err != nil {
+			return string(raw)
+		}
+		var b strings.Builder
+		for _, p := range parts {
+			if p.Type == "text" || (p.Type == "" && p.Text != "") {
+				b.WriteString(p.Text)
+			}
+		}
+		return b.String()
+	}
+}
+
+func hasMedia(req *chatRequest) bool {
+	for _, m := range req.Messages {
+		if s, ok := m.Content.(string); ok || m.Content == nil {
+			_ = s
+			continue
+		}
+		raw, _ := json.Marshal(m.Content)
+		var parts []struct {
+			Type     string `json:"type"`
+			ImageURL any    `json:"image_url"`
+			VideoURL any    `json:"video_url"`
+		}
+		if json.Unmarshal(raw, &parts) != nil {
+			continue
+		}
+		for _, p := range parts {
+			if p.ImageURL != nil || p.VideoURL != nil ||
+				p.Type == "image_url" || p.Type == "input_image" || p.Type == "input_video" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func toolSchemas(tools []toolDef) (map[string]*jsonschema.Schema, error) {
+	out := map[string]*jsonschema.Schema{}
+	for _, t := range tools {
+		if t.Type != "" && t.Type != "function" {
+			continue
+		}
+		compiler := jsonschema.NewCompiler()
+		compiler.UseLoader(localSchemas{})
+		// Normalize struct/map schemas to JSON values expected by the validator.
+		b, err := json.Marshal(t.Function.Parameters)
+		if err != nil {
+			return nil, err
+		}
+		var schema any
+		if len(b) == 0 || string(b) == "null" {
+			schema = map[string]any{"type": "object"}
+		} else if err = json.Unmarshal(b, &schema); err != nil {
+			return nil, err
+		}
+		if err = compiler.AddResource("https://proxy.local/tool.json", schema); err != nil {
+			return nil, err
+		}
+		s, err := compiler.Compile("https://proxy.local/tool.json")
+		if err != nil {
+			return nil, fmt.Errorf("tool %q schema: %w", t.Function.Name, err)
+		}
+		out[t.Function.Name] = s
+	}
+	return out, nil
+}
+
+// localSchemas disables external $ref downloads; local references work.
+type localSchemas struct{}
+
+func (localSchemas) Load(url string) (any, error) {
+	return nil, fmt.Errorf("external schema references disabled: %s", url)
+}
+
+func effectiveToolChoice(raw any, nTools int) string {
+	if nTools == 0 {
+		return "none"
+	}
+	if raw == nil {
+		return "auto"
+	}
+	switch v := raw.(type) {
+	case string:
+		return v // "auto" | "none" | "required"
+	case map[string]any:
+		if fn, ok := v["function"].(map[string]any); ok {
+			if name, ok := fn["name"].(string); ok {
+				return name
+			}
+		}
+		return "auto"
+	default:
+		rawJSON, _ := json.Marshal(raw)
+		var m map[string]any
+		if json.Unmarshal(rawJSON, &m) == nil {
+			if fn, ok := m["function"].(map[string]any); ok {
+				if name, ok := fn["name"].(string); ok {
+					return name
+				}
+			}
+		}
+		return "auto"
+	}
+}
+
+// canonicalEqual compares two messages the way the adapter's stored prefix
+// does: role + name + text + tool identity, ignoring equivalent JSON
+// argument encodings.
+func canonicalEqual(a, b message) bool {
+	if a.Role != b.Role || a.Name != b.Name || a.ToolCallID != b.ToolCallID {
+		return false
+	}
+	if textOf(a) != textOf(b) {
+		return false
+	}
+	if len(a.ToolCalls) != len(b.ToolCalls) {
+		return false
+	}
+	for i := range a.ToolCalls {
+		if a.ToolCalls[i].ID != b.ToolCalls[i].ID ||
+			a.ToolCalls[i].Function.Name != b.ToolCalls[i].Function.Name ||
+			!jsonEqual(a.ToolCalls[i].Function.Arguments, b.ToolCalls[i].Function.Arguments) {
+			return false
+		}
+	}
+	return true
+}
+
+func jsonEqual(a, b string) bool {
+	if a == b {
+		return true
+	}
+	var va, vb any
+	if json.Unmarshal([]byte(a), &va) != nil || json.Unmarshal([]byte(b), &vb) != nil {
+		return false
+	}
+	ra, _ := json.Marshal(va)
+	rb, _ := json.Marshal(vb)
+	return string(ra) == string(rb)
+}
+
+// systemPrompt renders the tool-teaching preamble for a fresh thread.
+func systemPrompt(tools []toolDef, choice string) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	raw, _ := json.Marshal(tools)
+	return "You are a tool-using assistant. Available functions (JSON schemas):\n" + string(raw) +
+		"\ntool_choice: " + choice + "\n" +
+		"To call a function, reply with ONLY one or more <opencode_bridge_call>{\"name\":\"...\",\"arguments\":{...}}</opencode_bridge_call> wrappers and no other text. " +
+		"Otherwise reply in plain text."
+}
+
+func (h *handler) writeError(w http.ResponseWriter, status int, code, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{"message": msg, "type": code, "code": code},
+	})
+}
+
+func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	var req chatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON: "+err.Error())
+		return
+	}
+	if len(req.Messages) == 0 {
+		h.writeError(w, http.StatusBadRequest, "invalid_request_error", "messages must not be empty")
+		return
+	}
+	if req.Model != h.model {
+		h.writeError(w, http.StatusBadRequest, "invalid_request_error", "unknown model")
+		return
+	}
+	if hasMedia(&req) {
+		h.writeError(w, http.StatusBadRequest, "invalid_request_error", "media input is not supported in Phase 1 (text only)")
+		return
+	}
+	schemas, err := toolSchemas(req.Tools)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	choice := effectiveToolChoice(req.ToolChoice, len(req.Tools))
+
+	sid := sessionID(r)
+	hash := reqHash(&req)
+
+	// Whole-turn serial gate: one browser transaction at a time.
+	select {
+	case <-h.gate:
+		defer func() { h.gate <- struct{}{} }()
+	case <-r.Context().Done():
+		h.writeError(w, http.StatusRequestTimeout, "timeout", "request canceled while queued")
+		return
+	}
+
+	h.mu.Lock()
+	sess, ok := h.sessions[sid]
+	if !ok {
+		sess = &session{}
+		h.sessions[sid] = sess
+	}
+	// Exact last-request retry: same bytes, same completion identity.
+	// The cached answer is re-validated (schemas may have changed) and the
+	// assistant message rebuilt deterministically with the stored IDs.
+	if sess.LastReqHash == hash && sess.LastRespID != "" {
+		calls, verr := gemini.ExtractExecutableCalls(sess.LastAnswer, schemas, choice)
+		if verr != nil {
+			diag := h.sentDiagnosis(sid, sess)
+			h.mu.Unlock()
+			h.writeError(w, http.StatusUnprocessableEntity, "invalid_request_error",
+				"cached answer failed tool-protocol validation: "+verr.Error()+"; "+diag)
+			return
+		}
+		resp := h.buildCompletion(&req, sess.LastAnswer, calls, sess.LastToolIDs, sess.LastCreated, sess.LastRespID)
+		h.mu.Unlock()
+		h.writeChatResponse(w, &req, resp)
+		return
+	}
+	var reseedPlan *rewritePlan
+	if sess.Pending {
+		// Dirty path: read-only recovery first (exact adoption, then
+		// hash-lineage auto-resync), then dirty rewrite-reseed. Success
+		// records the completed turn and falls through to
+		// duplicate-cache/delta below; a reseed plan abandons the
+		// uncertain thread and continues as a fresh reseed seed;
+		// otherwise 409 + diagnosis with Dirty untouched.
+		h.mu.Unlock()
+		if h.recoverPending(r, sid) {
+			h.mu.Lock()
+			sess = h.sessions[sid]
+			if sess == nil {
+				h.mu.Unlock()
+				h.writeError(w, http.StatusInternalServerError, "server_error", "recovery lost the session journal")
+				return
+			}
+		} else {
+			h.mu.Lock()
+			s2 := h.sessions[sid]
+			h.mu.Unlock()
+			if plan := h.planDirtyReseed(sid, s2, req.Messages); plan != nil {
+				log.Printf("[openai] session=%s rewrite-reseed armed classification=%s carried=%d not_carried=%d; abandoning uncertain thread without adoption",
+					shortSID(sid), plan.classification, len(plan.carriedIDs), len(plan.notCarried))
+				reseedPlan = plan
+				h.mu.Lock()
+				sess = h.sessions[sid]
+				if sess == nil {
+					h.mu.Unlock()
+					h.writeError(w, http.StatusInternalServerError, "server_error", "recovery lost the session journal")
+					return
+				}
+			} else {
+				h.mu.Lock()
+				diag := h.sentDiagnosis(sid, h.sessions[sid])
+				h.mu.Unlock()
+				h.writeError(w, http.StatusConflict, "pending_turn", "previous submission is uncertain; inspect the owned Gemini chat, then use a new session ID; no automatic resubmission; "+diag)
+				return
+			}
+		}
+	}
+	// Delta vs fresh: incoming history extending the stored prefix sends
+	// only the suffix; anything else starts a new chat and replays the
+	// history as one bounded turn. A reseed plan skips delta: the stored
+	// prefix belongs to the abandoned thread.
+	var toSend string
+	fresh := true
+	if reseedPlan == nil && h.hasActive && h.activeSID == sid && len(sess.Messages) > 0 && len(req.Messages) >= len(sess.Messages) {
+		match := true
+		for i := range sess.Messages {
+			if !canonicalEqual(sess.Messages[i], req.Messages[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			fresh = false
+			var b strings.Builder
+			if teach := h.teachReminder(req, sess); teach != "" {
+				b.WriteString(teach + "\n\n")
+			}
+			for _, m := range req.Messages[len(sess.Messages):] {
+				b.WriteString(formatForBrowser(m) + "\n")
+			}
+			toSend = b.String()
+		}
+	}
+	if fresh {
+		var b strings.Builder
+		sysHead := ""
+		if sys := systemPrompt(req.Tools, choice); sys != "" {
+			sysHead = sys + "\n\n"
+		}
+		// History-rewrite reseed: the incoming history is a coherent
+		// rewrite (revert/fork/compaction) of committed state, so seed
+		// a fresh chat with the rewritten timeline plus carried
+		// executed results instead of replaying blind. Incoherent input
+		// plans nothing and keeps the legacy replay below (clean
+		// sessions hold no uncertainty to protect).
+		if reseedPlan == nil && len(sess.Messages) > 0 && sess.URL != "" {
+			if mm := firstMismatch(req.Messages, sess.Messages); mm != nil {
+				log.Printf("[openai] session=%s prefix_mismatch index=%d field=%s incoming_messages=%d saved_messages=%d",
+					shortSID(sid), mm.Index, mm.Field, len(req.Messages), len(sess.Messages))
+				reseedPlan = planCleanReseed(sess, req.Messages)
+				if reseedPlan != nil {
+					log.Printf("[openai] session=%s rewrite_reseed classification=%s carried=%d not_carried=%d old=%s",
+						shortSID(sid), reseedPlan.classification, len(reseedPlan.carriedIDs), len(reseedPlan.notCarried), reseedPlan.oldURL)
+				}
+			}
+		}
+		if reseedPlan != nil {
+			toSend = buildReseedSeed(sysHead, req.Messages, reseedPlan)
+		} else {
+			b.WriteString(sysHead)
+			for _, m := range req.Messages {
+				b.WriteString(formatForBrowser(m) + "\n")
+			}
+			toSend = b.String()
+		}
+		if len(toSend) > h.maxChars {
+			h.mu.Unlock()
+			h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				fmt.Sprintf("turn bytes %d exceed per-turn budget %d; history replay chunking is Phase 2", len(toSend), h.maxChars))
+			return
+		}
+	}
+	canonical := append([]message{}, req.Messages...)
+	if len(toSend) > h.maxChars {
+		h.mu.Unlock()
+		h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "turn exceeds per-turn budget")
+		return
+	}
+	sess.Pending = true
+	sess.PendingPrompt = toSend
+	sess.PendingMessages = canonical
+	sess.PendingTools = req.Tools
+	sess.PendingChoice = req.ToolChoice
+	sess.PendingReqHash = hash
+	h.saveLocked()
+	h.mu.Unlock()
+
+	// Best-effort read-only thread linkage for the sent-log. Empty when
+	// the browser is unreachable; the submission is still recorded.
+	preURL := h.currentThreadURL(r.Context())
+	h.mu.Lock()
+	if preURL != "" {
+		sess.URL = preURL
+	}
+	// Single-turn submit path: one prompt per Ask (chunk 1 of 1).
+	// Over-budget turns are rejected with 413 above, never split.
+	h.appendSent(sentEntry{Event: "submitted", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1})
+	h.saveLocked()
+	h.mu.Unlock()
+
+	started := time.Now()
+	log.Printf("[openai] session=%s stage=browser-start fresh=%v prompt_bytes=%d tools=%d", shortSID(sid), fresh, len(toSend), len(req.Tools))
+	answer, err := h.client.Ask(gemini.WithTurnIdentity(r.Context(), sid+"\x00"+hash), toSend, fresh, 10*time.Minute)
+	if err != nil {
+		log.Printf("[openai] session=%s stage=browser-failed duration=%s not_submitted=%v", shortSID(sid), time.Since(started).Round(time.Millisecond), errors.Is(err, gemini.ErrNotSubmitted))
+		if errors.Is(err, gemini.ErrNotLoggedIn) || errors.Is(err, gemini.ErrNotSubmitted) || errors.Is(err, gemini.ErrNoComposer) || gemini.IsNavigateError(err) {
+			h.mu.Lock()
+			sess.Pending = false
+			sess.PendingPrompt = ""
+			sess.PendingMessages = nil
+			sess.PendingTools = nil
+			sess.PendingChoice = nil
+			sess.PendingReqHash = ""
+			h.appendSent(sentEntry{Event: "failed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1})
+			h.saveLocked()
+			h.mu.Unlock()
+		} else {
+			// Uncertain outcome: the submission may have reached the
+			// thread. PendingPrompt is kept for hash-lineage diagnosis.
+			h.mu.Lock()
+			h.appendSent(sentEntry{Event: "interrupted", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1})
+			h.saveLocked()
+			h.mu.Unlock()
+		}
+		if errors.Is(err, gemini.ErrNotLoggedIn) {
+			h.writeError(w, http.StatusUnauthorized, "authentication_error", "not logged in to gemini.google.com — run gemini-proxy -wait-login")
+			return
+		}
+		h.writeError(w, http.StatusBadGateway, "server_error", "BACKEND FAILURE: "+err.Error())
+		return
+	}
+
+	// Validate the protocol BEFORE emitting anything (buffered SSE).
+	calls, err := gemini.ExtractExecutableCalls(answer, schemas, choice)
+	if err != nil {
+		h.mu.Lock()
+		// The submission completed (an answer arrived) but failed strict
+		// protocol validation: no calls are delivered. The outcome is
+		// recorded; the Dirty lifecycle is unchanged (a later recovery
+		// batch owns it).
+		h.appendSent(sentEntry{Event: "completed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1, AnswerHash: gemini.AnswerHash(answer), Note: "answer rejected by tool-protocol validation; no calls delivered"})
+		diag := h.sentDiagnosis(sid, sess)
+		h.saveLocked()
+		h.mu.Unlock()
+		h.writeError(w, http.StatusUnprocessableEntity, "invalid_request_error",
+			"model output failed tool-protocol validation: "+err.Error()+"; "+diag)
+		return
+	}
+
+	created := time.Now().Unix()
+	respID := fmt.Sprintf("chatcmpl-gemini-%d", created)
+	var toolIDs []string
+	for i := range calls {
+		toolIDs = append(toolIDs, fmt.Sprintf("call_gemini_%d_%d", created, i))
+	}
+
+	h.mu.Lock()
+	sess.Messages = canonical
+	sess.LastAnswer = answer
+	sess.LastReqHash = hash
+	sess.LastRespID = respID
+	sess.LastCreated = created
+	sess.LastToolIDs = toolIDs
+	sess.Pending = false
+	sess.PendingPrompt = ""
+	sess.PendingMessages = nil
+	sess.PendingTools = nil
+	sess.PendingChoice = nil
+	sess.PendingReqHash = ""
+	if postURL := h.currentThreadURL(r.Context()); postURL != "" {
+		sess.URL = postURL
+	}
+	h.appendSent(sentEntry{Event: "completed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1, AnswerHash: gemini.AnswerHash(answer)})
+	if reseedPlan != nil {
+		// The commit records the linkage: abandoned thread, rewrite
+		// classification, and carried/dropped lists — in the journal
+		// and the sent-log, so both survive adapter restart.
+		sess.ReseedFrom = reseedPlan.oldURL
+		sess.ReseedEvidence = reseedPlan.evidence(sess.URL, len(toSend))
+		h.appendSent(sentEntry{Event: "reseed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Note: reseedPlan.note(sess.URL)})
+		log.Printf("[openai] session=%s rewrite-reseed committed %s", shortSID(sid), sess.ReseedEvidence)
+	}
+	h.activeSID, h.hasActive = sid, true
+	h.saveLocked()
+	h.mu.Unlock()
+
+	log.Printf("[openai] session=%s fresh=%v prompt_bytes=%d tools=%d answer_bytes=%d tool_calls=%d",
+		shortSID(sid), fresh, len(toSend), len(req.Tools), len(answer), len(toolIDs))
+	h.writeChatResponse(w, &req, h.buildCompletion(&req, answer, calls, toolIDs, created, respID))
+}
+
+// teachReminder names the available functions on continuations (schemas were
+// taught on the fresh thread; the thread holds them server-side).
+func (h *handler) teachReminder(req chatRequest, sess *session) string {
+	if len(req.Tools) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		names = append(names, t.Function.Name)
+	}
+	_ = sess
+	return "Reminder: available functions: " + strings.Join(names, ", ") +
+		". Reply with ONLY <opencode_bridge_call> wrappers to call one, else plain text."
+}
+
+// formatForBrowser renders one client message as browser-submitted text.
+// Assistant tool calls/results become inert labeled transcripts (context,
+// never executable — validation rejects wrappers found in imports because
+// history turns are quoted, not raw).
+func formatForBrowser(m message) string {
+	switch m.Role {
+	case "system":
+		return "[System instructions]\n" + textOf(m)
+	case "assistant":
+		if len(m.ToolCalls) > 0 {
+			raw, _ := json.Marshal(m.ToolCalls)
+			return "[Assistant tool calls (history, inert)]\n" + string(raw)
+		}
+		return "[Assistant answer (history)]\n" + textOf(m)
+	case "tool":
+		return "[Tool result for " + m.ToolCallID + " (history)]\n" + textOf(m)
+	default:
+		if m.Name != "" {
+			return "[" + m.Name + "]\n" + textOf(m)
+		}
+		return textOf(m)
+	}
+}
+
+type completionChoice struct {
+	Index        int     `json:"index"`
+	Message      message `json:"message"`
+	FinishReason string  `json:"finish_reason"`
+}
+type completion struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []completionChoice `json:"choices"`
+	Usage   map[string]int     `json:"usage"`
+}
+
+func (h *handler) buildCompletion(req *chatRequest, answer string, calls []*gemini.BridgeCall, toolIDs []string, created int64, id string) *completion {
+	msg := message{Role: "assistant"}
+	finish := "stop"
+	if len(calls) > 0 {
+		for i, c := range calls {
+			rawArgs, _ := json.Marshal(c.Arguments)
+			tcID := fmt.Sprintf("call_rebuilt_%d", i)
+			if i < len(toolIDs) {
+				tcID = toolIDs[i]
+			}
+			msg.ToolCalls = append(msg.ToolCalls, toolCall{
+				ID: tcID, Type: "function",
+				Function: callFunction{Name: c.Name, Arguments: string(rawArgs)},
+			})
+		}
+		finish = "tool_calls"
+	} else {
+		msg.Content = answer
+	}
+	return &completion{ID: id, Object: "chat.completion", Created: created, Model: req.Model,
+		Choices: []completionChoice{{Index: 0, Message: msg, FinishReason: finish}},
+		Usage:   map[string]int{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+}
+
+func (h *handler) writeChatResponse(w http.ResponseWriter, req *chatRequest, resp *completion) {
+	if req.Stream {
+		// Buffered SSE: emit the validated completion as deltas, then DONE.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		choice := resp.Choices[0]
+		meta := map[string]any{
+			"id": resp.ID, "object": "chat.completion.chunk", "created": resp.Created, "model": resp.Model,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil}},
+		}
+		writeSSE(w, meta)
+		if len(choice.Message.ToolCalls) > 0 {
+			for i, tc := range choice.Message.ToolCalls {
+				delta := map[string]any{
+					"id": resp.ID, "object": "chat.completion.chunk", "created": resp.Created, "model": resp.Model,
+					"choices": []map[string]any{{"index": 0, "delta": map[string]any{
+						"tool_calls": []map[string]any{{"index": i, "id": tc.ID, "type": "function",
+							"function": map[string]any{"name": tc.Function.Name, "arguments": tc.Function.Arguments}}},
+					}, "finish_reason": nil}},
+				}
+				writeSSE(w, delta)
+			}
+		} else if s, ok := choice.Message.Content.(string); ok && s != "" {
+			delta := map[string]any{
+				"id": resp.ID, "object": "chat.completion.chunk", "created": resp.Created, "model": resp.Model,
+				"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": s}, "finish_reason": nil}},
+			}
+			writeSSE(w, delta)
+		}
+		done := map[string]any{
+			"id": resp.ID, "object": "chat.completion.chunk", "created": resp.Created, "model": resp.Model,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": choice.FinishReason}},
+		}
+		writeSSE(w, done)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if fl != nil {
+			fl.Flush()
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func writeSSE(w http.ResponseWriter, v any) {
+	raw, _ := json.Marshal(v)
+	_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+func shortSID(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
+}
