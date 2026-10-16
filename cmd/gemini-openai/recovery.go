@@ -124,7 +124,7 @@ func (h *handler) readPendingTurn(r *http.Request, id string, s *session) (gemin
 // resyncEvidence ("" for plain adoption) is journaled; sentNote annotates
 // the sent-log completion. On any failure it returns false with no state
 // change. Recovery never executes anything itself.
-func (h *handler) recordCompletedTurn(id string, s *session, answer, resyncEvidence, sentNote string) bool {
+func (h *handler) recordCompletedTurn(id string, s *session, answer string, images []gemini.ResponseImage, resyncEvidence, sentNote string) bool {
 	if len(s.PendingMessages) == 0 {
 		return false
 	}
@@ -153,8 +153,9 @@ func (h *handler) recordCompletedTurn(id string, s *session, answer, resyncEvide
 	defer h.mu.Unlock()
 	old := *s
 	s.Messages = append(append([]message{}, s.PendingMessages...),
-		message{Role: "assistant", Content: answer, ToolCalls: h.rebuildToolCalls(calls, toolIDs)})
+		message{Role: "assistant", Content: assistantContent(answer, images), ToolCalls: h.rebuildToolCalls(calls, toolIDs)})
 	s.LastAnswer = answer
+	s.LastImages = images
 	s.LastReqHash = s.PendingReqHash
 	s.LastRespID = respID
 	s.LastCreated = created
@@ -218,7 +219,7 @@ func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) (b
 	if mismatch != nil || !adopted {
 		return false, mismatch
 	}
-	if !h.recordCompletedTurn(id, s, res.Answer, "", "adopted interrupted turn; recorded, never executed by recovery") {
+	if !h.recordCompletedTurn(id, s, res.Answer, res.Images, "", "adopted interrupted turn; recorded, never executed by recovery") {
 		return false, nil
 	}
 	log.Printf("[openai] session=%s adopted interrupted turn answer_bytes=%d", id, len(res.Answer))
@@ -270,7 +271,7 @@ func (h *handler) tryAutoResync(r *http.Request, id string, s *session, mismatch
 	pendingHash := gemini.PromptHash(s.PendingPrompt)
 	evidence := fmt.Sprintf("auto-resync %s: transplanted %dB thread answer (hash %s) from thread %s; thread submission hash %s == sent-log %s entry (%s); pending hash %s differed by structural spans %s, proving pending-overwritten-by-retry desync; deemed safe: thread holds this session's verifiably complete answer, validated against the pending schemas and recorded (never executed by recovery)",
 		time.Now().UTC().Format(time.RFC3339), len(res.Answer), shortHash12(gemini.AnswerHash(res.Answer)), s.URL, shortHash12(entry.PromptHash), entry.Event, entry.At, shortHash12(pendingHash), mismatch.Spans)
-	if !h.recordCompletedTurn(id, s, res.Answer, evidence, "auto-resync transplant; recorded, never executed by recovery") {
+	if !h.recordCompletedTurn(id, s, res.Answer, res.Images, evidence, "auto-resync transplant; recorded, never executed by recovery") {
 		return false
 	}
 	log.Printf("[openai] session=%s auto-resynced recognized desync shape answer_bytes=%d evidence=%q", id, len(res.Answer), evidence)

@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
@@ -648,8 +649,28 @@ func (c *Client) Status(ctx context.Context) (*Status, error) {
 // When newSession is true it starts a fresh chat first; otherwise it
 // continues the current conversation.
 func (c *Client) Ask(ctx context.Context, prompt string, newSession bool, timeout time.Duration) (string, error) {
+	text, _, err := c.askRich(ctx, prompt, newSession, timeout, false)
+	return text, err
+}
+
+// AskWithImages sends prompt to Gemini Web and returns the answer as
+// Markdown plus the retrievable output-image parts (inline data: payloads
+// within the documented caps). The text always carries the ChatGPT-consistent
+// fixtures and omit-notes, so callers that ignore parts still see explained
+// placeholders instead of bare "[Image 1]" stubs. Image collection is
+// read-only DOM/CDP (fetch of same-document blob: payloads and canvas
+// readback only) — no clicks, typing, submission, navigation, or tab churn
+// beyond the single submitted turn itself.
+func (c *Client) AskWithImages(ctx context.Context, prompt string, newSession bool, timeout time.Duration) (string, []ResponseImage, error) {
+	return c.askRich(ctx, prompt, newSession, timeout, true)
+}
+
+// askRich is the shared submit-and-wait flow for Ask/AskWithImages.
+// With collectImages it additionally resolves image bytes read-only after
+// the answer stabilizes; without it the behavior is exactly Ask's.
+func (c *Client) askRich(ctx context.Context, prompt string, newSession bool, timeout time.Duration, collectImages bool) (string, []ResponseImage, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", errors.New("prompt must not be empty")
+		return "", nil, errors.New("prompt must not be empty")
 	}
 	if timeout <= 0 || timeout > 30*time.Minute {
 		timeout = DefaultTimeout
@@ -657,6 +678,46 @@ func (c *Client) Ask(ctx context.Context, prompt string, newSession bool, timeou
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	beforeIDs, err := c.prepareSubmission(ctx, prompt, newSession)
+	if err != nil {
+		return "", nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.typeAndSubmitLocked(ctx, prompt); err != nil {
+		return "", nil, err
+	}
+	html, err := c.waitForAnswerLocked(ctx, beforeIDs)
+	if err != nil {
+		return "", nil, err
+	}
+	if !collectImages {
+		text := ConvertResponseHTML(html)
+		if strings.TrimSpace(text) == "" {
+			return "", nil, ErrMissingAnswer
+		}
+		return text, nil, nil
+	}
+	live := c.collectLiveImagesLocked(ctx)
+	text, parts := ConvertResponseWithLiveImages(html, live.Imgs, live.Canvas)
+	if strings.TrimSpace(text) == "" && len(parts) == 0 {
+		return "", nil, ErrMissingAnswer
+	}
+	// An image-only answer still needs text beside the parts: the fixtures
+	// above guarantee non-empty text whenever nodes were seen; an empty
+	// fragment with live pixels alone keeps the parts with a short note.
+	if strings.TrimSpace(text) == "" {
+		text = "[Image: model-generated visual content]"
+	}
+	return text, parts, nil
+}
+
+// prepareSubmission runs the bounded pre-submission phase: draft-identity
+// guard, auth-gated turn preparation, and the before-set snapshot. It
+// provably types and submits nothing, so transport blips rebuild instead of
+// risking a double submit. Callers must not hold c.mu.
+func (c *Client) prepareSubmission(ctx context.Context, prompt string, newSession bool) (map[string]bool, error) {
 	// Pre-submission phase (bounded retry): ensure, auth gate, new chat.
 	// Retries here are provably safe — nothing is typed or submitted yet,
 	// so a transport blip rebuilds instead of risking a double submit.
@@ -670,18 +731,18 @@ func (c *Client) Ask(ctx context.Context, prompt string, newSession bool, timeou
 		c.mu.Unlock()
 		identity, _ := ctx.Value(turnIdentityKey{}).(string)
 		if pendingDraft != "" && (pendingDraft != prompt || pendingIdentity != identity) {
-			return "", fmt.Errorf("%w: another owned draft requires reconciliation; refusing to replace it", ErrNotSubmitted)
+			return nil, fmt.Errorf("%w: another owned draft requires reconciliation; refusing to replace it", ErrNotSubmitted)
 		}
 		if err := c.prepareTurn(ctx, newSession && pendingDraft == ""); err != nil {
 			lastErr = err
 			if ctx.Err() != nil {
-				return "", fmt.Errorf("%w: prepare canceled: %v", ErrNotSubmitted, ctx.Err())
+				return nil, fmt.Errorf("%w: prepare canceled: %v", ErrNotSubmitted, ctx.Err())
 			}
 			if errors.Is(err, ErrNotLoggedIn) {
-				return "", err // page state, not transport: never churn on this
+				return nil, err // page state, not transport: never churn on this
 			}
 			if !isStaleErr(err) && !IsNavigateError(err) && !errors.Is(err, ErrNotSubmitted) {
-				return "", fmt.Errorf("%w: prepare: %v", ErrNotSubmitted, err)
+				return nil, fmt.Errorf("%w: prepare: %v", ErrNotSubmitted, err)
 			}
 			c.mu.Lock()
 			c.teardownLocked()
@@ -703,23 +764,9 @@ func (c *Client) Ask(ctx context.Context, prompt string, newSession bool, timeou
 		if lastErr == nil {
 			lastErr = errors.New("could not prepare turn")
 		}
-		return "", fmt.Errorf("%w: prepare: %v", ErrNotSubmitted, lastErr)
+		return nil, fmt.Errorf("%w: prepare: %v", ErrNotSubmitted, lastErr)
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.typeAndSubmitLocked(ctx, prompt); err != nil {
-		return "", err
-	}
-	html, err := c.waitForAnswerLocked(ctx, beforeIDs)
-	if err != nil {
-		return "", err
-	}
-	text := ConvertResponseHTML(html)
-	if strings.TrimSpace(text) == "" {
-		return "", ErrMissingAnswer
-	}
-	return text, nil
+	return beforeIDs, nil
 }
 
 // prepareTurn ensures the browser, enforces the auth gate, and starts
@@ -974,6 +1021,90 @@ const newestModelResponseJS = `(function(){
       return clean.outerHTML;}}
   return '';
 })()`
+
+// responseImagesJS is a READ-ONLY probe of the last model-response's
+// image-bearing nodes: current <img> sources plus same-document blob: payload
+// resolution, and <canvas> readback. It performs no clicks, typing,
+// submission, navigation, reload, or tab churn — attribute reads,
+// canvas-to-dataURL, and GET fetches of same-document blob: URLs only.
+// Callers evaluate it with await-promise semantics (blob resolution is
+// async) under a bounded budget; any failure degrades to empty slots and the
+// pure outerHTML path still carries the fixtures.
+const responseImagesJS = `(async function(){
+  var out={imgs:[],canvas:[]};
+  try{
+    var nodes=document.querySelectorAll('model-response');
+    var scope=document;
+    if(nodes.length){scope=nodes[nodes.length-1];}
+    var toDataURL=function(blob){return new Promise(function(res){
+      try{var fr=new FileReader();
+        fr.onload=function(){try{res(fr.result||'');}catch(_){res('');}};
+        fr.onerror=function(){res('');};
+        fr.readAsDataURL(blob);
+      }catch(_){res('');}
+    });};
+    var imgs=scope.querySelectorAll('img');
+    var n=Math.min(imgs.length,8);
+    for(var i=0;i<n;i++){
+      var el=imgs[i];
+      var alt=el.getAttribute('alt')||el.getAttribute('aria-label')||el.getAttribute('title')||'';
+      var src=el.currentSrc||el.getAttribute('src')||el.getAttribute('data-src')||'';
+      out.imgs.push({alt:alt,src:src,dataURL:''});
+    }
+    for(var k=0;k<out.imgs.length;k++){
+      var rec=out.imgs[k];
+      if(rec.src&&rec.src.indexOf('blob:')===0){
+        try{
+          var r=await fetch(rec.src);
+          if(r.ok){var b=await r.blob();rec.dataURL=await toDataURL(b);}
+        }catch(_){rec.dataURL='';}
+      }
+    }
+    var cv=scope.querySelectorAll('canvas');
+    var m=Math.min(cv.length,4);
+    for(var j=0;j<m;j++){
+      var c=cv[j];
+      var ca=c.getAttribute('alt')||c.getAttribute('aria-label')||'';
+      var durl='';
+      try{
+        if(c.width>0&&c.height>0&&c.width*c.height<=16777216){durl=c.toDataURL('image/png')||'';}
+      }catch(_){durl='';}
+      out.canvas.push({alt:ca,src:'',dataURL:durl});
+    }
+  }catch(_){}
+  return out;
+})()`
+
+// liveImageSlot is one read-only collected image slot, aligned per kind in
+// document order with parseImageNodes' within-kind sequences.
+type liveImageSlot struct {
+	Alt     string `json:"alt"`
+	Src     string `json:"src"`
+	DataURL string `json:"dataURL"`
+}
+
+// liveImageSnapshot is the read-only collector result.
+type liveImageSnapshot struct {
+	Imgs   []liveImageSlot `json:"imgs"`
+	Canvas []liveImageSlot `json:"canvas"`
+}
+
+// collectLiveImagesLocked evaluates the read-only image probe against the
+// owned tab. Callers must hold c.mu (same discipline as the answer wait that
+// precedes it). Any failure returns an empty snapshot: the pure outerHTML
+// fixtures still carry the turn.
+func (c *Client) collectLiveImagesLocked(ctx context.Context) liveImageSnapshot {
+	var snap liveImageSnapshot
+	if c.tab == nil {
+		return snap
+	}
+	rctx, cancel := operationContext(c.tab, ctx, 30*time.Second)
+	defer cancel()
+	_ = chromedp.Run(rctx, chromedp.Evaluate(responseImagesJS, &snap,
+		chromedp.EvalAsValue,
+		func(p *runtime.EvaluateParams) *runtime.EvaluateParams { return p.WithAwaitPromise(true) }))
+	return snap
+}
 
 // jsQuote renders s as a JS string literal (JSON encoding is valid JS).
 func jsQuote(s string) string {

@@ -71,6 +71,10 @@ type TurnResult struct {
 	Answer    string
 	Reasoning string // Gemini renders no separate reasoning recap; always "".
 	URL       string
+	// Images holds the retrievable output-image parts for the same answer
+	// (inline data: payloads within caps). Empty for text-only turns; the
+	// Answer text always carries the fixtures and notes regardless.
+	Images []ResponseImage
 }
 
 // UserBubbleMismatchError is the structural adoption failure: the thread's
@@ -301,9 +305,12 @@ func gateThreadAnswer(url string, snap threadSnapshot) (TurnResult, error) {
 	if snap.generating || !snap.complete || strings.TrimSpace(snap.answerHTML) == "" {
 		return TurnResult{}, errors.New("stored thread answer is not a finished rendering; inspect before recovery")
 	}
-	text := ConvertResponseHTML(snap.answerHTML)
-	if strings.TrimSpace(text) == "" {
+	text, parts := ConvertResponseWithImages(snap.answerHTML)
+	if strings.TrimSpace(text) == "" && len(parts) == 0 {
 		return TurnResult{}, errors.New("stored thread holds no complete assistant answer to adopt")
 	}
-	return TurnResult{Answer: text, URL: url}, nil
+	if strings.TrimSpace(text) == "" {
+		text = "[Image: model-generated visual content]"
+	}
+	return TurnResult{Answer: text, Images: parts, URL: url}, nil
 }

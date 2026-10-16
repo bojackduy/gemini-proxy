@@ -49,8 +49,16 @@ func run() error {
 	background := flag.Bool("background", false, "minimize Chrome")
 	model := flag.String("model", "gemini-web", "model ID")
 	maxChars := flag.Int("max-chars", 200000, "maximum bytes per Gemini turn")
+	maxImages := flag.Int("max-images", gemini.MaxResponseImages, "maximum output images carried as image_url parts per turn")
+	maxImageBytes := flag.Int("max-image-bytes", gemini.MaxResponseImageBytes, "maximum decoded bytes accepted per output image")
 	state := flag.String("state", filepath.Join(defaultProfile(), "openai-sessions.json"), "persistent session state")
 	flag.Parse()
+
+	// Output-image budgets (documented defaults live beside the extractor).
+	// Oversized/over-count images degrade to omit-notes in the text; the
+	// turn itself never fails for image reasons.
+	gemini.MaxResponseImages = *maxImages
+	gemini.MaxResponseImageBytes = *maxImageBytes
 
 	cg := gemini.New(*port, *profile, *chrome)
 	cg.Background = *background
@@ -129,6 +137,7 @@ type session struct {
 	Pending      bool      `json:"pending,omitempty"`
 	Messages     []message `json:"messages"`
 	LastAnswer   string    `json:"last_answer,omitempty"`
+	LastImages   []gemini.ResponseImage `json:"last_images,omitempty"`
 	LastReqHash  string    `json:"last_req_hash,omitempty"`
 	LastRespID   string    `json:"last_resp_id,omitempty"`
 	LastCreated  int64     `json:"last_created,omitempty"`
@@ -169,6 +178,75 @@ type browserClient interface {
 	LoginState(ctx context.Context) (*gemini.Status, error)
 	ReadThreadTurn(ctx context.Context, url, prompt string) (gemini.TurnResult, error)
 	ReadLatestThreadTurn(ctx context.Context, url string) (string, gemini.TurnResult, error)
+}
+
+// imageAsker is the optional rich-submission surface: *gemini.Client
+// implements it, returning the answer text plus retrievable output-image
+// parts. Handlers prefer it when available and fall back to Ask otherwise,
+// so older fakes keep working. Collection is read-only DOM/CDP (same channel
+// discipline as the rest of the bridge: no new navigation or session-state
+// side effects).
+type imageAsker interface {
+	AskWithImages(ctx context.Context, prompt string, newSession bool, timeout time.Duration) (string, []gemini.ResponseImage, error)
+}
+
+// askTurn submits one turn via the richest surface the client offers.
+func (h *handler) askTurn(ctx context.Context, prompt string, fresh bool) (string, []gemini.ResponseImage, error) {
+	if ia, ok := h.client.(imageAsker); ok {
+		return ia.AskWithImages(ctx, prompt, fresh, 10*time.Minute)
+	}
+	answer, err := h.client.Ask(ctx, prompt, fresh, 10*time.Minute)
+	return answer, nil, err
+}
+
+// assistantContent builds the assistant message payload: plain string for
+// text-only turns (wire-identical to before), multipart text + image_url
+// parts when retrievable output images exist.
+func assistantContent(answer string, images []gemini.ResponseImage) any {
+	if len(images) == 0 {
+		return answer
+	}
+	parts := []any{map[string]any{"type": "text", "text": answer}}
+	for _, img := range images {
+		if strings.TrimSpace(img.URL) == "" {
+			continue
+		}
+		parts = append(parts, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": img.URL},
+		})
+	}
+	if len(parts) == 1 {
+		return answer
+	}
+	return parts
+}
+
+// streamTextOf extracts the text deltas for buffered SSE. Image parts ride
+// only the non-streaming completion; the streamed text already carries the
+// fixtures and notes describing them.
+func streamTextOf(content any) []string {
+	if s, ok := content.(string); ok {
+		if s == "" {
+			return nil
+		}
+		return []string{s}
+	}
+	raw, _ := json.Marshal(content)
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range parts {
+		if p.Type == "text" && p.Text != "" {
+			out = append(out, p.Text)
+		}
+	}
+	return out
 }
 
 type handler struct {
@@ -555,7 +633,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				"cached answer failed tool-protocol validation: "+verr.Error()+"; "+diag)
 			return
 		}
-		resp := h.buildCompletion(&req, sess.LastAnswer, calls, sess.LastToolIDs, sess.LastCreated, sess.LastRespID)
+		resp := h.buildCompletion(&req, sess.LastAnswer, sess.LastImages, calls, sess.LastToolIDs, sess.LastCreated, sess.LastRespID)
 		h.mu.Unlock()
 		h.writeChatResponse(w, &req, resp)
 		return
@@ -696,7 +774,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	started := time.Now()
 	log.Printf("[openai] session=%s stage=browser-start fresh=%v prompt_bytes=%d tools=%d", shortSID(sid), fresh, len(toSend), len(req.Tools))
-	answer, err := h.client.Ask(gemini.WithTurnIdentity(r.Context(), sid+"\x00"+hash), toSend, fresh, 10*time.Minute)
+	answer, images, err := h.askTurn(gemini.WithTurnIdentity(r.Context(), sid+"\x00"+hash), toSend, fresh)
 	if err != nil {
 		log.Printf("[openai] session=%s stage=browser-failed duration=%s not_submitted=%v", shortSID(sid), time.Since(started).Round(time.Millisecond), errors.Is(err, gemini.ErrNotSubmitted))
 		if errors.Is(err, gemini.ErrNotLoggedIn) || errors.Is(err, gemini.ErrNotSubmitted) || errors.Is(err, gemini.ErrNoComposer) || gemini.IsNavigateError(err) {
@@ -753,6 +831,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	sess.Messages = canonical
 	sess.LastAnswer = answer
+	sess.LastImages = images
 	sess.LastReqHash = hash
 	sess.LastRespID = respID
 	sess.LastCreated = created
@@ -780,9 +859,9 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	h.saveLocked()
 	h.mu.Unlock()
 
-	log.Printf("[openai] session=%s fresh=%v prompt_bytes=%d tools=%d answer_bytes=%d tool_calls=%d",
-		shortSID(sid), fresh, len(toSend), len(req.Tools), len(answer), len(toolIDs))
-	h.writeChatResponse(w, &req, h.buildCompletion(&req, answer, calls, toolIDs, created, respID))
+	log.Printf("[openai] session=%s fresh=%v prompt_bytes=%d tools=%d answer_bytes=%d tool_calls=%d images=%d",
+		shortSID(sid), fresh, len(toSend), len(req.Tools), len(answer), len(toolIDs), len(images))
+	h.writeChatResponse(w, &req, h.buildCompletion(&req, answer, images, calls, toolIDs, created, respID))
 }
 
 // teachReminder names the available functions on continuations (schemas were
@@ -838,7 +917,7 @@ type completion struct {
 	Usage   map[string]int     `json:"usage"`
 }
 
-func (h *handler) buildCompletion(req *chatRequest, answer string, calls []*gemini.BridgeCall, toolIDs []string, created int64, id string) *completion {
+func (h *handler) buildCompletion(req *chatRequest, answer string, images []gemini.ResponseImage, calls []*gemini.BridgeCall, toolIDs []string, created int64, id string) *completion {
 	msg := message{Role: "assistant"}
 	finish := "stop"
 	if len(calls) > 0 {
@@ -855,7 +934,7 @@ func (h *handler) buildCompletion(req *chatRequest, answer string, calls []*gemi
 		}
 		finish = "tool_calls"
 	} else {
-		msg.Content = answer
+		msg.Content = assistantContent(answer, images)
 	}
 	return &completion{ID: id, Object: "chat.completion", Created: created, Model: req.Model,
 		Choices: []completionChoice{{Index: 0, Message: msg, FinishReason: finish}},
@@ -886,12 +965,14 @@ func (h *handler) writeChatResponse(w http.ResponseWriter, req *chatRequest, res
 				}
 				writeSSE(w, delta)
 			}
-		} else if s, ok := choice.Message.Content.(string); ok && s != "" {
-			delta := map[string]any{
-				"id": resp.ID, "object": "chat.completion.chunk", "created": resp.Created, "model": resp.Model,
-				"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": s}, "finish_reason": nil}},
+		} else if texts := streamTextOf(choice.Message.Content); len(texts) > 0 {
+			for _, s := range texts {
+				delta := map[string]any{
+					"id": resp.ID, "object": "chat.completion.chunk", "created": resp.Created, "model": resp.Model,
+					"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": s}, "finish_reason": nil}},
+				}
+				writeSSE(w, delta)
 			}
-			writeSSE(w, delta)
 		}
 		done := map[string]any{
 			"id": resp.ID, "object": "chat.completion.chunk", "created": resp.Created, "model": resp.Model,

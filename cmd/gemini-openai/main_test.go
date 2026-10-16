@@ -765,3 +765,163 @@ func TestReseedEvidenceSurvivesRestart(t *testing.T) {
 		t.Fatalf("reseed linkage must survive restart: %+v", s)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Output images: multipart emission, rich-turn preference, recovery carriage.
+// ---------------------------------------------------------------------------
+
+func testImageParts() []gemini.ResponseImage {
+	return []gemini.ResponseImage{{Alt: "sales chart", URL: "data:image/png;base64,QUJD"}}
+}
+
+func TestAssistantContentMultipart(t *testing.T) {
+	// Text-only turns stay a plain string: wire-identical to before.
+	if c := assistantContent("hello", nil); c != "hello" {
+		t.Fatalf("text-only must stay a string: %#v", c)
+	}
+	parts, ok := assistantContent("Here: [Image: sales chart]", testImageParts()).([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("image turns must be multipart: %#v", assistantContent("x", testImageParts()))
+	}
+	text, ok := parts[0].(map[string]any)
+	if !ok || text["type"] != "text" {
+		t.Fatalf("first part must be text: %#v", parts[0])
+	}
+	img, ok := parts[1].(map[string]any)
+	if !ok || img["type"] != "image_url" {
+		t.Fatalf("second part must be image_url: %#v", parts[1])
+	}
+	if url, _ := img["image_url"].(map[string]any)["url"].(string); url != "data:image/png;base64,QUJD" {
+		t.Fatalf("image URL must pass through: %#v", img)
+	}
+	// Empty-URL slots never become parts; all-empty degrades to the string.
+	if c := assistantContent("t", []gemini.ResponseImage{{URL: " "}}); c != "t" {
+		t.Fatalf("empty URLs must degrade to text: %#v", c)
+	}
+}
+
+func TestStreamTextOf(t *testing.T) {
+	if got := streamTextOf("hello"); len(got) != 1 || got[0] != "hello" {
+		t.Fatalf("string content: %#v", got)
+	}
+	if got := streamTextOf(""); len(got) != 0 {
+		t.Fatalf("empty string: %#v", got)
+	}
+	got := streamTextOf(assistantContent("Here", testImageParts()))
+	if len(got) != 1 || got[0] != "Here" {
+		t.Fatalf("multipart streams text only (fixtures describe images): %#v", got)
+	}
+}
+
+// fakeImageBackend offers the rich AskWithImages surface.
+type fakeImageBackend struct {
+	fakeRecoveryBackend
+	richAnswer string
+	richImages []gemini.ResponseImage
+	richErr    error
+	usedRich   bool
+}
+
+func (f *fakeImageBackend) AskWithImages(_ context.Context, prompt string, newSession bool, _ time.Duration) (string, []gemini.ResponseImage, error) {
+	f.usedRich = true
+	f.gotPrompt = prompt
+	f.gotFresh = newSession
+	if f.richErr != nil {
+		return "", nil, f.richErr
+	}
+	return f.richAnswer, f.richImages, nil
+}
+
+func TestAskTurnPrefersRichSurface(t *testing.T) {
+	rich := &fakeImageBackend{richAnswer: "Here: [Image: sales chart]", richImages: testImageParts()}
+	h := &handler{model: "gemini-web", client: rich, sessions: map[string]*session{}, gate: make(chan struct{}, 1)}
+	answer, images, err := h.askTurn(context.Background(), "draw", true)
+	if err != nil || answer != "Here: [Image: sales chart]" || len(images) != 1 {
+		t.Fatalf("rich surface must win: %q %+v %v", answer, images, err)
+	}
+	if !rich.usedRich {
+		t.Fatal("AskWithImages must be preferred when offered")
+	}
+	// Legacy backends without the rich surface keep working (no images).
+	legacy := &fakeRecoveryBackend{askAnswer: "plain"}
+	h2 := &handler{model: "gemini-web", client: legacy, sessions: map[string]*session{}, gate: make(chan struct{}, 1)}
+	answer, images, err = h2.askTurn(context.Background(), "hi", true)
+	if err != nil || answer != "plain" || len(images) != 0 {
+		t.Fatalf("legacy Ask fallback broken: %q %+v %v", answer, images, err)
+	}
+}
+
+func TestCompletionCarriesImagePartsEndToEnd(t *testing.T) {
+	fake := &fakeImageBackend{richAnswer: "Here: [Image: sales chart]", richImages: testImageParts()}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, sessions: map[string]*session{}, gate: make(chan struct{}, 1)}
+	h.gate <- struct{}{}
+	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "draw a chart"}}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("image turn must succeed: %d %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content any `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(resp.Choices[0].Message.Content)
+	var parts []struct {
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		ImageURL *struct {
+			URL string `json:"url"`
+		} `json:"image_url"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil || len(parts) != 2 {
+		t.Fatalf("completion must be text + image_url parts: %s", string(raw))
+	}
+	if parts[0].Type != "text" || !strings.Contains(parts[0].Text, "[Image: sales chart]") {
+		t.Fatalf("text part must carry the fixture: %+v", parts[0])
+	}
+	if parts[1].Type != "image_url" || parts[1].ImageURL == nil || parts[1].ImageURL.URL != "data:image/png;base64,QUJD" {
+		t.Fatalf("image part must carry the bytes URL: %+v", parts[1])
+	}
+	// Exact retry serves the duplicate cache with the same parts.
+	w2 := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "draw a chart"}}})
+	if w2.Code != http.StatusOK || !strings.Contains(w2.Body.String(), "data:image/png;base64,QUJD") {
+		t.Fatalf("duplicate cache must replay image parts: %d %s", w2.Code, w2.Body.String())
+	}
+	if fake.asks != 0 {
+		t.Fatalf("cache must not resubmit: asks=%d", fake.asks)
+	}
+}
+
+func TestRecordCompletedTurnCarriesImages(t *testing.T) {
+	req := chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "draw"}}}
+	h := &handler{model: "gemini-web", sessions: map[string]*session{}, gate: make(chan struct{}, 1)}
+	h.gate <- struct{}{}
+	s := &session{Pending: true, PendingPrompt: "DRAW", URL: "https://gemini.google.com/app/abc",
+		PendingMessages: req.Messages, PendingReqHash: reqHash(&req)}
+	h.sessions["s"] = s
+	if !h.recordCompletedTurn("s", s, "Here: [Image: sales chart]", testImageParts(), "", "test") {
+		t.Fatal("recovery must record the image turn")
+	}
+	if len(s.LastImages) != 1 {
+		t.Fatalf("journal must keep the parts for duplicate-cache: %+v", s)
+	}
+	last := s.Messages[len(s.Messages)-1]
+	raw, _ := json.Marshal(last.Content)
+	if !strings.Contains(string(raw), "image_url") {
+		t.Fatalf("transcript must hold the multipart message: %s", string(raw))
+	}
+	// Unretrievable images (no parts) still record text + note, never fail.
+	s2 := &session{Pending: true, PendingPrompt: "DRAW2", URL: "https://gemini.google.com/app/abc",
+		PendingMessages: req.Messages, PendingReqHash: reqHash(&req)}
+	h.sessions["s2"] = s2
+	if !h.recordCompletedTurn("s2", s2, "[Image 1: visual content not retrievable from web UI]", nil, "", "test") {
+		t.Fatal("fallback text must record without parts")
+	}
+	if c, ok := s2.Messages[len(s2.Messages)-1].Content.(string); !ok || !strings.Contains(c, "not retrievable") {
+		t.Fatalf("fallback stays a plain string: %#v", s2.Messages[len(s2.Messages)-1].Content)
+	}
+}
