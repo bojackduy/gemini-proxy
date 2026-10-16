@@ -717,6 +717,9 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// executed results instead of replaying blind. Incoherent input
 		// plans nothing and keeps the legacy replay below (clean
 		// sessions hold no uncertainty to protect).
+		// Audit (2026-10-16): no legacy rotation path exists on this
+		// bridge, so the reseed plan can never be shadowed — this single
+		// mismatch path always carries the record and evidence.
 		if reseedPlan == nil && len(sess.Messages) > 0 && sess.URL != "" {
 			if mm := firstMismatch(req.Messages, sess.Messages); mm != nil {
 				log.Printf("[openai] session=%s prefix_mismatch index=%d field=%s incoming_messages=%d saved_messages=%d",
