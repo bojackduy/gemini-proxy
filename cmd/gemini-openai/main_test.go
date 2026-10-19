@@ -19,20 +19,72 @@ import (
 type fakeBackend struct{}
 
 func TestReadyBusyAndPendingAreNotAuthFailures(t *testing.T) {
-	for _, pending := range []bool{false, true} {
-		h := &handler{gate: make(chan struct{}, 1), sessions: map[string]*session{}}
-		want := "browser turn busy"
-		if pending {
-			h.gate <- struct{}{}
-			h.sessions["owned"] = &session{Pending: true}
-			want = "pending uncertain turn"
+	newHandler := func(client browserClient, sessions map[string]*session) *handler {
+		h := &handler{model: "gemini-web", client: client, gate: make(chan struct{}, 1), sessions: sessions}
+		h.gate <- struct{}{}
+		return h
+	}
+	readyz := func(h *handler, sid string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "/readyz", nil)
+		if sid != "" {
+			r.Header.Set("x-opencode-session-id", sid)
 		}
 		w := httptest.NewRecorder()
-		h.routes().ServeHTTP(w, httptest.NewRequest("GET", "/readyz", nil))
-		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), want) || strings.Contains(w.Body.String(), "not logged in") {
-			t.Fatalf("pending=%v: %d %s", pending, w.Code, w.Body.String())
-		}
+		h.routes().ServeHTTP(w, r)
+		return w
 	}
+
+	t.Run("busy gate is unavailable, never an auth failure", func(t *testing.T) {
+		h := &handler{model: "gemini-web", client: &fakeReadyBackend{}, gate: make(chan struct{}, 1), sessions: map[string]*session{}}
+		// Empty gate: a browser turn holds it.
+		w := readyz(h, "")
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "browser turn busy") || strings.Contains(w.Body.String(), "not logged in") {
+			t.Fatalf("busy: %d %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("one pending session does not report the provider unready", func(t *testing.T) {
+		h := newHandler(&fakeReadyBackend{}, map[string]*session{"stuck": {Pending: true}})
+		w := readyz(h, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("a pending session must not brick the provider: %d %s", w.Code, w.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body["ready"] != true || body["pending"] != float64(1) || !strings.Contains(w.Body.String(), "stuck") {
+			t.Fatalf("readiness must count and name the pending identities: %s", w.Body.String())
+		}
+	})
+
+	t.Run("the pending identity itself reports not-ready", func(t *testing.T) {
+		h := newHandler(&fakeReadyBackend{}, map[string]*session{"stuck": {Pending: true}, "live": {}})
+		w := readyz(h, "stuck")
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "pending uncertain turn; inspect owned chat") {
+			t.Fatalf("pending identity: %d %s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "not logged in") {
+			t.Fatalf("pending must never be reported as an auth failure: %s", w.Body.String())
+		}
+		if w := readyz(h, "live"); w.Code != http.StatusOK {
+			t.Fatalf("a clean identity stays ready while another is pending: %d %s", w.Code, w.Body.String())
+		}
+		// Journal truth outranks a transient busy gate.
+		busy := newHandler(&fakeReadyBackend{}, map[string]*session{"stuck": {Pending: true}})
+		<-busy.gate
+		if w := readyz(busy, "stuck"); w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "pending uncertain turn") {
+			t.Fatalf("pending identity must beat a busy gate: %d %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("a logged-out tab still discloses the pending count", func(t *testing.T) {
+		h := newHandler(&fakeRecoveryBackend{}, map[string]*session{"stuck": {Pending: true}})
+		w := readyz(h, "")
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), `"pending":1`) {
+			t.Fatalf("not-ready must never hide pending sessions: %d %s", w.Code, w.Body.String())
+		}
+	})
 }
 
 func (f *fakeBackend) Ask(_ interface{}, _ string, _ bool, _ interface{}) (string, error) {
@@ -129,15 +181,181 @@ func TestEmptyMessagesRejected(t *testing.T) {
 	}
 }
 
+// TestPendingTurnNeverCallsBrowser pins the per-session guard: a pending
+// record with no recoverable binding at all (no pending prompt) is refused
+// fast, with no browser read, no submission and no state change. The fake's
+// recovery readers are nil, so any read attempt would panic here.
 func TestPendingTurnNeverCallsBrowser(t *testing.T) {
-	h := &handler{model: "gemini-web", sessions: map[string]*session{"s": {Pending: true}}, gate: make(chan struct{}, 1)}
+	fake := &fakeRecoveryBackend{}
+	h := &handler{model: "gemini-web", client: fake, sessions: map[string]*session{"s": {Pending: true}}, gate: make(chan struct{}, 1)}
 	h.gate <- struct{}{}
-	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gemini-web","messages":[{"role":"user","content":"hello"}]}`))
-	r.Header.Set("X-Session-Id", "s")
-	w := httptest.NewRecorder()
-	h.routes().ServeHTTP(w, r)
-	if w.Code != http.StatusConflict {
+	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "hello"}}})
+	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("pending must fail closed: %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "pending uncertain turn; inspect owned chat") {
+		t.Fatalf("refusal must name the state: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "POST /v1/sessions/abandon") {
+		t.Fatalf("refusal must name the operator path for an unresolvable record: %s", w.Body.String())
+	}
+	if fake.asks != 0 {
+		t.Fatalf("a pending session must never submit: asks=%d", fake.asks)
+	}
+	if s := h.sessions["s"]; !s.Pending || s.PendingPrompt != "" || len(s.Messages) != 0 {
+		t.Fatalf("refusal must leave the session untouched: %+v", s)
+	}
+}
+
+// TestPendingSessionDoesNotBrickOthers is the anti-brick proof: an uncertain
+// identity refuses only itself while a different identity completes normally.
+func TestPendingSessionDoesNotBrickOthers(t *testing.T) {
+	fake := &fakeRecoveryBackend{askAnswer: "other session fine"}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "openai-sessions.json"),
+		sessions:  map[string]*session{"stuck": {Pending: true}}}
+	h.gate <- struct{}{}
+	w := postJSON(t, h, "live", chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "hello"}}})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "other session fine") {
+		t.Fatalf("a pending session must not brick another identity: %d %s", w.Code, w.Body.String())
+	}
+	if fake.asks != 1 {
+		t.Fatalf("the other identity must submit exactly once: asks=%d", fake.asks)
+	}
+	if s := h.sessions["stuck"]; !s.Pending || s.PendingPrompt != "" || len(s.Messages) != 0 {
+		t.Fatalf("the pending identity must be untouched by another turn: %+v", s)
+	}
+}
+
+// TestAbandonClearsOnlyNamedSessions pins the operator path: an explicit,
+// named, gated clear that drops only the pending binding — never a wildcard,
+// never automatic, and byte-identical for every session it did not name.
+func TestAbandonClearsOnlyNamedSessions(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "openai-sessions.json")
+	h := &handler{model: "gemini-web", statePath: state, maxChars: 200000, gate: make(chan struct{}, 1), sessions: map[string]*session{}}
+	h.gate <- struct{}{}
+	h.sessions["stuck"] = &session{
+		Pending: true, PendingPrompt: "legacy prompt", URL: "https://gemini.google.com/app/abc",
+		PendingMessages: []message{{Role: "user", Content: "legacy"}}, PendingTools: weatherTools(),
+		PendingChoice: "auto", PendingReqHash: "pending-hash",
+		Messages: []message{{Role: "user", Content: "kept"}}, LastAnswer: "kept answer",
+		LastReqHash: "keep-hash", LastRespID: "keep-id", LastToolIDs: []string{"call_keep"},
+	}
+	h.sessions["other"] = &session{
+		Pending: true, PendingPrompt: "other prompt", URL: "https://gemini.google.com/app/xyz",
+		PendingMessages: []message{{Role: "user", Content: "other"}},
+		Messages:        []message{{Role: "user", Content: "other kept"}},
+	}
+	h.saveLocked()
+	rawOther := func() string {
+		t.Helper()
+		b, err := os.ReadFile(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var file map[string]json.RawMessage
+		if err := json.Unmarshal(b, &file); err != nil {
+			t.Fatal(err)
+		}
+		return string(file["other"])
+	}
+	before := rawOther()
+
+	post := func(body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.routes().ServeHTTP(w, httptest.NewRequest("POST", "/v1/sessions/abandon", strings.NewReader(body)))
+		return w
+	}
+
+	// Refusals: nothing named, a wildcard, a mixed list, and a non-POST verb.
+	for _, body := range []string{
+		`{"sessions":[],"reason":"x"}`,
+		`{"sessions":["*"]}`,
+		`{"sessions":["all"]}`,
+		`{"sessions":["stuck",""]}`,
+		`{"sessions":["st*ck"]}`,
+	} {
+		if w := post(body); w.Code != http.StatusBadRequest {
+			t.Fatalf("body %s must be refused whole: %d %s", body, w.Code, w.Body.String())
+		}
+	}
+	wg := httptest.NewRecorder()
+	h.routes().ServeHTTP(wg, httptest.NewRequest("GET", "/v1/sessions/abandon", nil))
+	if wg.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("abandon must be POST only: %d", wg.Code)
+	}
+	if s := h.sessions["stuck"]; !s.Pending || s.PendingPrompt != "legacy prompt" {
+		t.Fatalf("a refused request must clear nothing: %+v", s)
+	}
+
+	// A busy gate refuses too: the operator path never races a browser turn.
+	busy := &handler{model: "gemini-web", gate: make(chan struct{}, 1), sessions: map[string]*session{"stuck": {Pending: true}}}
+	wb := httptest.NewRecorder()
+	busy.routes().ServeHTTP(wb, httptest.NewRequest("POST", "/v1/sessions/abandon", strings.NewReader(`{"sessions":["stuck"]}`)))
+	if wb.Code != http.StatusServiceUnavailable || !strings.Contains(wb.Body.String(), "browser turn busy") {
+		t.Fatalf("busy gate must refuse without clearing: %d %s", wb.Code, wb.Body.String())
+	}
+	if !busy.sessions["stuck"].Pending {
+		t.Fatal("a busy refusal must clear nothing")
+	}
+
+	// The explicit clear: one named pending session plus one unknown id.
+	w := post(`{"sessions":["stuck","missing"],"reason":"legacy record no code path can resolve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("abandon: %d %s", w.Code, w.Body.String())
+	}
+	var out struct {
+		Requested int `json:"requested"`
+		Abandoned int `json:"abandoned"`
+		Results   []struct {
+			Session string `json:"session"`
+			Outcome string `json:"outcome"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Requested != 2 || out.Abandoned != 1 || len(out.Results) != 2 ||
+		out.Results[0].Session != "stuck" || out.Results[0].Outcome != "abandoned" ||
+		out.Results[1].Session != "missing" || out.Results[1].Outcome != "unknown" {
+		t.Fatalf("every named session needs its own outcome: %s", w.Body.String())
+	}
+
+	s := h.sessions["stuck"]
+	if s.Pending || s.PendingPrompt != "" || len(s.PendingMessages) != 0 || len(s.PendingTools) != 0 || s.PendingChoice != nil || s.PendingReqHash != "" {
+		t.Fatalf("abandon must clear the whole pending binding: %+v", s)
+	}
+	if s.URL != "https://gemini.google.com/app/abc" || len(s.Messages) != 1 || s.Messages[0].Content != "kept" ||
+		s.LastAnswer != "kept answer" || s.LastReqHash != "keep-hash" || s.LastRespID != "keep-id" || len(s.LastToolIDs) != 1 {
+		t.Fatalf("abandon must retain transcript, URL, cache identity, result and tools: %+v", s)
+	}
+	if o := h.sessions["other"]; !o.Pending || o.PendingPrompt != "other prompt" {
+		t.Fatalf("only named sessions may change: %+v", o)
+	}
+	if after := rawOther(); after != before {
+		t.Fatalf("unnamed sessions must stay byte-identical:\nbefore %s\nafter  %s", before, after)
+	}
+
+	// Durable: a restart loads the cleared binding and the untouched neighbour.
+	restarted := &handler{statePath: state, sessions: map[string]*session{}}
+	if err := restarted.load(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if rs := restarted.sessions["stuck"]; rs == nil || rs.Pending || rs.PendingPrompt != "" {
+		t.Fatalf("abandon must be durable: %+v", rs)
+	}
+	if ro := restarted.sessions["other"]; ro == nil || !ro.Pending {
+		t.Fatalf("unnamed pending sessions must stay pending on disk: %+v", ro)
+	}
+
+	// The abandoned identity serves requests again (nothing was cleared but
+	// the pending binding, so its transcript is still usable).
+	fake := &fakeRecoveryBackend{askAnswer: "resumed"}
+	h.client = fake
+	w2 := postJSON(t, h, "stuck", chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "continued"}}})
+	if w2.Code != http.StatusOK || fake.asks != 1 {
+		t.Fatalf("an abandoned session must serve again: %d asks=%d %s", w2.Code, fake.asks, w2.Body.String())
 	}
 }
 
@@ -297,6 +515,14 @@ func (f *fakeRecoveryBackend) ReadThreadTurn(_ context.Context, url, prompt stri
 
 func (f *fakeRecoveryBackend) ReadLatestThreadTurn(_ context.Context, url string) (string, gemini.TurnResult, error) {
 	return f.readLatest(url)
+}
+
+// fakeReadyBackend reports a signed-in tab so readiness paths can be exercised
+// without a browser. Only the login probe differs from fakeRecoveryBackend.
+type fakeReadyBackend struct{ fakeRecoveryBackend }
+
+func (f *fakeReadyBackend) LoginState(context.Context) (*gemini.Status, error) {
+	return &gemini.Status{LoggedIn: true, Composer: true}, nil
 }
 
 func structuralMismatch() *gemini.UserBubbleMismatchError {

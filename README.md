@@ -148,6 +148,28 @@ go build -o bin/gemini-openai ./cmd/gemini-openai
 It connects to the logged-in Chrome profile `~/.gemini-proxy` on port 9223 and
 creates **its own tab**. `/readyz` probes that tab without navigating.
 
+Readiness is per session: a session holding an uncertain pending turn is reported
+not-ready only to a probe that names it (`x-opencode-session-id`), while the
+provider keeps reporting `ready:true` with a `pending` count and the pending
+session ids. One stuck session therefore never makes the model unavailable for
+everyone else.
+
+Clearing a pending record that no code path can resolve — for example one written
+before the recovery stack existed, with `pending` set and no stored prompt — is an
+explicit operator action. It is never automatic, never a wildcard, and it refuses
+while a turn is in flight:
+
+```sh
+curl -sX POST 127.0.0.1:8789/v1/sessions/abandon \
+  -d '{"sessions":["ses_..."],"reason":"legacy pending record, no stored prompt"}'
+```
+
+Only the pending binding is cleared; the transcript, thread URL, duplicate-cache
+identity and last result are retained, so the session keeps working. For any
+pending record that still carries its prompt and thread, the adapter's own
+recovery (exact adoption, hash-lineage auto-resync, rewrite reseed) runs first and
+is never weakened by this endpoint.
+
 The adapter speaks the exact `<opencode_bridge_call>` tool protocol from
 chatgpt-proxy, so the plugin treats both engines identically. State lives in
 `~/.gemini-proxy/openai-sessions.json` (atomic replacement, mode 0600).

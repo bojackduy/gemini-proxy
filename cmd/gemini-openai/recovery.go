@@ -160,12 +160,7 @@ func (h *handler) recordCompletedTurn(id string, s *session, answer string, imag
 	s.LastRespID = respID
 	s.LastCreated = created
 	s.LastToolIDs = toolIDs
-	s.Pending = false
-	s.PendingPrompt = ""
-	s.PendingMessages = nil
-	s.PendingTools = nil
-	s.PendingChoice = nil
-	s.PendingReqHash = ""
+	clearPendingBinding(s)
 	if resyncEvidence != "" {
 		s.AutoResyncEvidence = resyncEvidence
 	}

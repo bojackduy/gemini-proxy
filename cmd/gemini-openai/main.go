@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -321,7 +322,21 @@ func (h *handler) routes() http.Handler {
 	})
 	// /readyz probes the tab WITHOUT navigating: logged-in + composer
 	// present. 503 while the page hydrates or the user is signed out.
+	//
+	// An uncertain pending turn is journal truth about ONE identity, so it is
+	// reported as such: the provider stays ready for every other identity and
+	// says honestly how many sessions are pending (that blanket refusal is
+	// what made one unresolvable record look like a provider-wide outage).
+	// A probe that names a pending identity gets a not-ready answer for that
+	// identity. The pending set needs no browser, so it is read before the
+	// gate.
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		pendingIDs := h.pendingSessionIDs()
+		if sid := readySessionID(r); sid != "" && containsString(pendingIDs, sid) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(readyBody(false, "pending uncertain turn; inspect owned chat", pendingIDs))
+			return
+		}
 		// Do not wait behind a browser turn and misreport its deadline as auth
 		// failure. Readiness is a probe, never a competing browser operation.
 		select {
@@ -329,18 +344,7 @@ func (h *handler) routes() http.Handler {
 			defer func() { h.gate <- struct{}{} }()
 		default:
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ready": false, "detail": "browser turn busy"})
-			return
-		}
-		h.mu.Lock()
-		pending := false
-		for _, s := range h.sessions {
-			pending = pending || s.Pending
-		}
-		h.mu.Unlock()
-		if pending {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ready": false, "detail": "pending uncertain turn; inspect owned chat"})
+			_ = json.NewEncoder(w).Encode(readyBody(false, "browser turn busy", pendingIDs))
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -354,10 +358,10 @@ func (h *handler) routes() http.Handler {
 			} else if !st.LoggedIn {
 				detail = "not logged in to gemini.google.com"
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"ready": false, "detail": detail})
+			_ = json.NewEncoder(w).Encode(readyBody(false, detail, pendingIDs))
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"ready": true})
+		_ = json.NewEncoder(w).Encode(readyBody(true, readyPendingDetail(pendingIDs), pendingIDs))
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -369,7 +373,67 @@ func (h *handler) routes() http.Handler {
 		})
 	})
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
+	mux.HandleFunc("/v1/sessions/abandon", h.abandonSessions)
 	return mux
+}
+
+// pendingSessionIDs lists the identities holding an uncertain pending turn,
+// sorted so readiness bodies are stable. It takes h.mu; callers hold nothing.
+func (h *handler) pendingSessionIDs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var ids []string
+	for id, s := range h.sessions {
+		if s != nil && s.Pending {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// readySessionID resolves the identity a readiness probe asks about. The GUI
+// sends x-opencode-session-id; the completion path also honours X-Session-Id /
+// X-Opencode-Session / X-Session-Affinity. A probe using any of them is
+// answered for its own identity instead of for the provider as a whole. Empty
+// means "no identity given": the provider answers for itself.
+func readySessionID(r *http.Request) string {
+	if v := strings.TrimSpace(r.Header.Get("X-Opencode-Session-Id")); v != "" {
+		return v
+	}
+	return sessionID(r)
+}
+
+// readyBody reports readiness without hiding pending sessions: the count rides
+// every answer and the identities are named, so a client can never be told
+// everything is fine while an uncertain turn sits in the journal.
+func readyBody(ready bool, detail string, pendingIDs []string) map[string]any {
+	if detail == "" {
+		detail = "no pending sessions"
+	}
+	body := map[string]any{"ready": ready, "pending": len(pendingIDs), "detail": detail}
+	if len(pendingIDs) > 0 {
+		body["pending_sessions"] = pendingIDs
+	}
+	return body
+}
+
+// readyPendingDetail describes a serving provider that still holds pending
+// identities: each of them refuses only its own requests.
+func readyPendingDetail(pendingIDs []string) string {
+	if len(pendingIDs) == 0 {
+		return "no pending sessions"
+	}
+	return fmt.Sprintf("%d session(s) hold an uncertain pending turn and refuse only their own requests; inspect the owned chat, or clear an unresolvable record explicitly via POST /v1/sessions/abandon", len(pendingIDs))
 }
 
 // currentThreadURL is a best-effort read-only probe of the owned tab's URL
@@ -638,6 +702,25 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.writeChatResponse(w, &req, resp)
 		return
 	}
+	// Per-session pending guard. An uncertain submission refuses ITS OWN
+	// requests only: every other identity keeps working, which is the property
+	// the global readiness gate used to stand in for. This is a real refusal —
+	// no submission, no browser action, no state change for this session.
+	//
+	// The dirty path below still owns every record recovery can act on (exact
+	// adoption, hash-lineage auto-resync, rewrite reseed — all fail-closed).
+	// A record carrying none of the recovery preconditions, e.g. pending=true
+	// with an empty pending prompt written before the recovery stack existed,
+	// could never be adopted or reseeded, so it is refused here instead of
+	// buying a 90s browser read that cannot succeed. Clearing such a record is
+	// an explicit operator action: POST /v1/sessions/abandon.
+	if sess.Pending && sess.PendingPrompt == "" {
+		diag := h.sentDiagnosis(sid, sess)
+		h.mu.Unlock()
+		h.writeError(w, http.StatusServiceUnavailable, "pending_turn",
+			"pending uncertain turn; inspect owned chat; "+diag+"; no code path can resolve this record (no stored prompt); clear it explicitly via POST /v1/sessions/abandon")
+		return
+	}
 	var reseedPlan *rewritePlan
 	if sess.Pending {
 		// Dirty path: read-only recovery first (exact adoption, then
@@ -782,12 +865,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[openai] session=%s stage=browser-failed duration=%s not_submitted=%v", shortSID(sid), time.Since(started).Round(time.Millisecond), errors.Is(err, gemini.ErrNotSubmitted))
 		if errors.Is(err, gemini.ErrNotLoggedIn) || errors.Is(err, gemini.ErrNotSubmitted) || errors.Is(err, gemini.ErrNoComposer) || gemini.IsNavigateError(err) {
 			h.mu.Lock()
-			sess.Pending = false
-			sess.PendingPrompt = ""
-			sess.PendingMessages = nil
-			sess.PendingTools = nil
-			sess.PendingChoice = nil
-			sess.PendingReqHash = ""
+			clearPendingBinding(sess)
 			h.appendSent(sentEntry{Event: "failed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1})
 			h.saveLocked()
 			h.mu.Unlock()
@@ -839,12 +917,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	sess.LastRespID = respID
 	sess.LastCreated = created
 	sess.LastToolIDs = toolIDs
-	sess.Pending = false
-	sess.PendingPrompt = ""
-	sess.PendingMessages = nil
-	sess.PendingTools = nil
-	sess.PendingChoice = nil
-	sess.PendingReqHash = ""
+	clearPendingBinding(sess)
 	if postURL := h.currentThreadURL(r.Context()); postURL != "" {
 		sess.URL = postURL
 	}
