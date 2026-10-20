@@ -96,6 +96,14 @@ func TestSessionIDPriority(t *testing.T) {
 	r.Header.Set("X-Session-Affinity", "aff")
 	r.Header.Set("X-Opencode-Session", "opencode")
 	r.Header.Set("X-Session-Id", "primary")
+	r.Header.Set("X-Opencode-Session-Id", "child")
+	if got := sessionID(r); got != "child" {
+		t.Fatalf("v2 child identity priority: got %q", got)
+	}
+	if got := readySessionID(r); got != "child" {
+		t.Fatalf("readiness and completions must agree on identity: got %q", got)
+	}
+	r.Header.Del("X-Opencode-Session-Id")
 	if got := sessionID(r); got != "primary" {
 		t.Fatalf("priority: got %q", got)
 	}
@@ -285,8 +293,29 @@ func TestAbandonClearsOnlyNamedSessions(t *testing.T) {
 	if wg.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("abandon must be POST only: %d", wg.Code)
 	}
+	crossOrigin := httptest.NewRequest("POST", "/v1/sessions/abandon", strings.NewReader(`{"sessions":["stuck"]}`))
+	crossOrigin.Header.Set("Origin", "https://attacker.example")
+	blocked := httptest.NewRecorder()
+	h.routes().ServeHTTP(blocked, crossOrigin)
+	if blocked.Code != http.StatusForbidden {
+		t.Fatalf("browser-originated abandon must be refused: %d %s", blocked.Code, blocked.Body.String())
+	}
 	if s := h.sessions["stuck"]; !s.Pending || s.PendingPrompt != "legacy prompt" {
 		t.Fatalf("a refused request must clear nothing: %+v", s)
+	}
+
+	// If persistence fails, the endpoint must not report success or leave
+	// an in-memory clear that disappears after restart.
+	failedSave := &handler{
+		model: "gemini-web", statePath: t.TempDir(),
+		gate:     make(chan struct{}, 1),
+		sessions: map[string]*session{"stuck": {Pending: true, PendingPrompt: "keep pending"}},
+	}
+	failedSave.gate <- struct{}{}
+	wf := httptest.NewRecorder()
+	failedSave.routes().ServeHTTP(wf, httptest.NewRequest("POST", "/v1/sessions/abandon", strings.NewReader(`{"sessions":["stuck"]}`)))
+	if wf.Code != http.StatusInternalServerError || !failedSave.sessions["stuck"].Pending || failedSave.sessions["stuck"].PendingPrompt != "keep pending" {
+		t.Fatalf("failed persistence must roll back the pending binding: %d %s", wf.Code, wf.Body.String())
 	}
 
 	// A busy gate refuses too: the operator path never races a browser turn.

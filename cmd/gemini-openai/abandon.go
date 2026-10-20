@@ -73,6 +73,12 @@ func (h *handler) abandonSessions(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "abandon requires POST")
 		return
 	}
+	// This is an operator-only state mutation, not a browser API. Reject
+	// browser-originated requests, including cross-site POSTs to loopback.
+	if r.Header.Get("Origin") != "" {
+		h.writeError(w, http.StatusForbidden, "invalid_request_error", "browser-originated abandonment is forbidden")
+		return
+	}
 	var req abandonRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON: "+err.Error())
@@ -118,6 +124,7 @@ func (h *handler) abandonSessions(w http.ResponseWriter, r *http.Request) {
 
 	cleared := 0
 	results := make([]abandonResult, 0, len(ids))
+	originals := make(map[string]session)
 	h.mu.Lock()
 	for _, id := range ids {
 		switch s := h.sessions[id]; {
@@ -126,6 +133,7 @@ func (h *handler) abandonSessions(w http.ResponseWriter, r *http.Request) {
 		case !s.Pending:
 			results = append(results, abandonResult{Session: id, Outcome: "not_pending"})
 		default:
+			originals[id] = *s
 			clearPendingBinding(s)
 			cleared++
 			results = append(results, abandonResult{Session: id, Outcome: "abandoned"})
@@ -133,7 +141,14 @@ func (h *handler) abandonSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	if cleared > 0 {
 		// Durable before the response: the journal is the restart record.
-		h.saveLocked()
+		if err := h.saveLocked(); err != nil {
+			for id, previous := range originals {
+				*h.sessions[id] = previous
+			}
+			h.mu.Unlock()
+			h.writeError(w, http.StatusInternalServerError, "server_error", "session abandonment could not be persisted")
+			return
+		}
 	}
 	h.mu.Unlock()
 

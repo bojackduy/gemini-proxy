@@ -135,15 +135,15 @@ type chatRequest struct {
 // has already seen), the last answer, and the last completion identity for
 // exact-retry duplicate-cache.
 type session struct {
-	Pending      bool      `json:"pending,omitempty"`
-	Messages     []message `json:"messages"`
-	LastAnswer   string    `json:"last_answer,omitempty"`
+	Pending      bool                   `json:"pending,omitempty"`
+	Messages     []message              `json:"messages"`
+	LastAnswer   string                 `json:"last_answer,omitempty"`
 	LastImages   []gemini.ResponseImage `json:"last_images,omitempty"`
-	LastReqHash  string    `json:"last_req_hash,omitempty"`
-	LastRespID   string    `json:"last_resp_id,omitempty"`
-	LastCreated  int64     `json:"last_created,omitempty"`
-	LastToolIDs  []string  `json:"last_tool_ids,omitempty"`
-	NewSessionAt int64     `json:"new_session_at"`
+	LastReqHash  string                 `json:"last_req_hash,omitempty"`
+	LastRespID   string                 `json:"last_resp_id,omitempty"`
+	LastCreated  int64                  `json:"last_created,omitempty"`
+	LastToolIDs  []string               `json:"last_tool_ids,omitempty"`
+	NewSessionAt int64                  `json:"new_session_at"`
 	// URL is the owned Gemini chat/thread URL submissions went to. It
 	// ties sent-log entries and future recovery reads to the thread.
 	URL string `json:"url,omitempty"`
@@ -291,25 +291,26 @@ func (h *handler) load() error {
 
 // saveLocked persists sessions atomically (write temp + rename, mode 0600).
 // Callers must hold h.mu.
-func (h *handler) saveLocked() {
+func (h *handler) saveLocked() error {
 	raw, err := json.Marshal(h.sessions)
 	if err != nil {
 		log.Printf("[openai] save marshal: %v", err)
-		return
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(h.statePath), 0o700); err != nil {
 		log.Printf("[openai] save mkdir: %v", err)
-		return
+		return err
 	}
 	tmp := h.statePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		log.Printf("[openai] save write: %v", err)
-		return
+		return err
 	}
 	if err := os.Rename(tmp, h.statePath); err != nil {
 		log.Printf("[openai] save rename: %v", err)
-		return
+		return err
 	}
+	return nil
 }
 
 // --- routes --------------------------------------------------------------------
@@ -407,9 +408,6 @@ func containsString(list []string, want string) bool {
 // answered for its own identity instead of for the provider as a whole. Empty
 // means "no identity given": the provider answers for itself.
 func readySessionID(r *http.Request) string {
-	if v := strings.TrimSpace(r.Header.Get("X-Opencode-Session-Id")); v != "" {
-		return v
-	}
 	return sessionID(r)
 }
 
@@ -448,10 +446,12 @@ func (h *handler) currentThreadURL(ctx context.Context) string {
 	return h.client.CurrentURL(ctx)
 }
 
-// sessionID resolves client identity: X-Session-Id, x-opencode-session, or
-// x-session-affinity (that priority order). Empty means isolated fresh chat.
+// sessionID resolves the actual child identity first. OpenCode v2 sends the
+// child in x-opencode-session-id; the other headers may identify its parent
+// or legacy affinity and must not silently merge separate child transcripts.
+// Empty means isolated fresh chat.
 func sessionID(r *http.Request) string {
-	for _, k := range []string{"X-Session-Id", "X-Opencode-Session", "X-Session-Affinity"} {
+	for _, k := range []string{"X-Opencode-Session-Id", "X-Session-Id", "X-Opencode-Session", "X-Session-Affinity"} {
 		if v := strings.TrimSpace(r.Header.Get(k)); v != "" {
 			return v
 		}
