@@ -1180,3 +1180,77 @@ func TestRecordCompletedTurnCarriesImages(t *testing.T) {
 		t.Fatalf("fallback stays a plain string: %#v", s2.Messages[len(s2.Messages)-1].Content)
 	}
 }
+
+// TestDraftRefusalMappingIsNonRetryable pins the distinction the chat depends
+// on: a draft the bridge cannot verify is a 422 the person must act on, while a
+// genuine pre-submit transport failure stays a retryable 502. Neither sentence
+// may name an endpoint or echo the prompt.
+func TestDraftRefusalMappingIsNonRetryable(t *testing.T) {
+	const secret = "the private prompt body"
+	newHandler := func(err error) *handler {
+		be := &fakeRecoveryBackend{askErr: err, urlNow: ""}
+		be.readTurn = func(string, string) (gemini.TurnResult, error) { return gemini.TurnResult{}, nil }
+		be.readLatest = func(string) (string, gemini.TurnResult, error) { return "", gemini.TurnResult{}, nil }
+		h := &handler{model: "gemini-web", client: be, maxChars: 200000, gate: make(chan struct{}, 1), sessions: map[string]*session{}}
+		h.gate <- struct{}{}
+		return h
+	}
+	post := func(h *handler) *httptest.ResponseRecorder {
+		body := `{"model":"gemini-web","messages":[{"role":"user","content":"` + secret + `"}]}`
+		r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+		r.Header.Set("X-Session-Id", "s")
+		w := httptest.NewRecorder()
+		h.routes().ServeHTTP(w, r)
+		return w
+	}
+
+	t.Run("foreign draft is non-retryable and actionable", func(t *testing.T) {
+		h := newHandler(gemini.ErrForeignDraft)
+		w := post(h)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("foreign draft must be 422, not a retryable backend failure: %d %s", w.Code, w.Body.String())
+		}
+		out := w.Body.String()
+		for _, want := range []string{"cannot verify it wrote", "Nothing from your previous message was resent", "dedicated Gemini Web Chrome window"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("refusal missing %q: %s", want, out)
+			}
+		}
+		for _, bad := range []string{"BACKEND FAILURE", "http://", "POST /v1/", secret} {
+			if strings.Contains(out, bad) {
+				t.Fatalf("refusal leaks %q: %s", bad, out)
+			}
+		}
+		if h.sessions["s"] != nil && h.sessions["s"].Pending {
+			t.Fatal("a refusal must leave no pending binding")
+		}
+	})
+
+	t.Run("attempted draft is non-retryable", func(t *testing.T) {
+		h := newHandler(gemini.ErrDraftOwned)
+		w := post(h)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("attempted draft must be 422: %d %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "may already have been sent") {
+			t.Fatalf("attempted draft must say the turn may exist: %s", w.Body.String())
+		}
+		// Uncertain turns must never invite a blind retry.
+		for _, want := range []string{"Do not resend", "no tools were re-run"} {
+			if !strings.Contains(w.Body.String(), want) {
+				t.Fatalf("attempted draft guidance missing %q: %s", want, w.Body.String())
+			}
+		}
+	})
+
+	t.Run("pre-submit transport failure stays retryable", func(t *testing.T) {
+		h := newHandler(gemini.ErrNotSubmitted)
+		w := post(h)
+		if w.Code == http.StatusUnprocessableEntity {
+			t.Fatalf("a retryable transport failure must not be reported as a draft refusal: %d %s", w.Code, w.Body.String())
+		}
+		if w.Code != http.StatusBadGateway {
+			t.Fatalf("transport failure: %d %s", w.Code, w.Body.String())
+		}
+	})
+}

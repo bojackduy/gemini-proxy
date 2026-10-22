@@ -863,7 +863,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	answer, images, err := h.askTurn(gemini.WithTurnIdentity(r.Context(), sid+"\x00"+hash), toSend, fresh)
 	if err != nil {
 		log.Printf("[openai] session=%s stage=browser-failed duration=%s not_submitted=%v", shortSID(sid), time.Since(started).Round(time.Millisecond), errors.Is(err, gemini.ErrNotSubmitted))
-		if errors.Is(err, gemini.ErrNotLoggedIn) || errors.Is(err, gemini.ErrNotSubmitted) || errors.Is(err, gemini.ErrNoComposer) || gemini.IsNavigateError(err) {
+		if errors.Is(err, gemini.ErrNotLoggedIn) || gemini.IsPreSubmit(err) || errors.Is(err, gemini.ErrNoComposer) || gemini.IsNavigateError(err) {
 			h.mu.Lock()
 			clearPendingBinding(sess)
 			h.appendSent(sentEntry{Event: "failed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1})
@@ -879,6 +879,19 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, gemini.ErrNotLoggedIn) {
 			h.writeError(w, http.StatusUnauthorized, "authentication_error", "not logged in to gemini.google.com — run gemini-proxy -wait-login")
+			return
+		}
+		if errors.Is(err, gemini.ErrForeignDraft) || errors.Is(err, gemini.ErrDraftOwned) {
+			// Nothing was typed over and nothing was sent, so retrying the same
+			// request would only refuse again. The person gets the outcome and
+			// the one thing they can do instead of a selector diagnostic.
+			unknown := "This chat box holds text this bridge cannot verify it wrote, so it was left untouched."
+			next := "Nothing from your previous message was resent. Next: open the dedicated Gemini Web Chrome window and keep or clear that text yourself before sending your message again."
+			if errors.Is(err, gemini.ErrDraftOwned) {
+				unknown = "This chat box still holds a message from an attempt that may already have been sent, so it was left untouched."
+				next = "Do not resend it. Nothing from your previous message was resent and no tools were re-run. Next: open the dedicated Gemini Web Chrome window and read that conversation for the answer; clearing the chat box is a separate manual step there."
+			}
+			h.writeError(w, http.StatusUnprocessableEntity, "invalid_request_error", unknown+" "+next)
 			return
 		}
 		h.writeError(w, http.StatusBadGateway, "server_error", "BACKEND FAILURE: "+err.Error())

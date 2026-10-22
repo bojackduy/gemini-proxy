@@ -13,6 +13,7 @@ package gemini
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,9 +27,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
-	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/cdproto/emulation"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 )
@@ -54,7 +56,19 @@ var (
 	ErrMissingAnswer       = errors.New("Gemini generation ended without an extractable new model answer; inspect the tab and retry; no automatic resubmission")
 	ErrNotSubmitted        = errors.New("turn failed before any submission action")
 	ErrSubmissionUncertain = errors.New("submission action outcome is uncertain; no automatic resubmission")
+	// ErrForeignDraft marks a refusal that retrying cannot fix: the composer
+	// holds text this bridge cannot prove it wrote. It deliberately does not
+	// wrap ErrNotSubmitted, so callers cannot downgrade it to a safe retry.
+	ErrForeignDraft = errors.New("composer holds a draft this bridge cannot verify; refusing to overwrite it")
+	ErrDraftOwned   = errors.New("composer holds this bridge's own draft from a turn whose submission may have been dispatched; refusing to touch it")
 )
+
+// IsPreSubmit reports a failure proven to have happened before any submission
+// action, so the session stays clean instead of becoming uncertain. It does NOT
+// imply retrying helps: a foreign draft is pre-submit yet needs a person.
+func IsPreSubmit(err error) bool {
+	return errors.Is(err, ErrNotSubmitted) || errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrDraftOwned)
+}
 
 // IsNavigateError reports a page-navigation failure. All navigate steps run
 // before anything is typed or submitted, so a caller that sees only such an
@@ -169,6 +183,20 @@ type Client struct {
 	ownedTarget     target.ID
 	draftPrompt     string // retained only after a provably unsubmitted insertion
 	draftIdentity   string // adapter session + exact request; never cross-client reuse
+	// draftHash fingerprints the logical document this bridge inserted. With
+	// draftPrompt it proves ownership across a page reload, where Quill's
+	// page-scoped marker is gone.
+	draftHash string
+	// draftDoc is the EXACT logical document this bridge left, draftTarget is
+	// the CDP target it was written on and draftThread the conversation URL at
+	// that moment. Ownership requires all three to match: a marker or a hash
+	// alone on a different tab or thread is not proof.
+	draftDoc    string
+	draftTarget string
+	draftThread string
+	// draftSubmitted fences the draft permanently once a Send may have fired:
+	// the composer still holding it is never evidence that the turn did not go.
+	draftSubmitted bool
 }
 
 // New builds a client with defaults for anything zero-valued.
@@ -221,6 +249,9 @@ func (c *Client) teardownLocked() {
 	c.wsURL = ""
 	c.draftPrompt = ""
 	c.draftIdentity = ""
+	c.draftDoc = ""
+	c.draftTarget = ""
+	c.draftThread = ""
 }
 
 // tabAlive exercises the full CDP chain (tab session -> allocator websocket)
@@ -727,11 +758,12 @@ func (c *Client) prepareSubmission(ctx context.Context, prompt string, newSessio
 	for attempt := 0; attempt < 2 && !submissionReady; attempt++ {
 		c.mu.Lock()
 		pendingDraft := c.draftPrompt
-		pendingIdentity := c.draftIdentity
+		pendingSubmitted := c.draftSubmitted
 		c.mu.Unlock()
-		identity, _ := ctx.Value(turnIdentityKey{}).(string)
-		if pendingDraft != "" && (pendingDraft != prompt || pendingIdentity != identity) {
-			return nil, fmt.Errorf("%w: another owned draft requires reconciliation; refusing to replace it", ErrNotSubmitted)
+		if pendingDraft != "" && pendingSubmitted {
+			// An attempted turn's draft is evidence, not scratch space. It is
+			// never replaced automatically, and retrying cannot fix that.
+			return nil, fmt.Errorf("%w: an earlier turn's draft may already have been sent, so it is left untouched", ErrDraftOwned)
 		}
 		if err := c.prepareTurn(ctx, newSession && pendingDraft == ""); err != nil {
 			lastErr = err
@@ -880,21 +912,137 @@ func WithTurnIdentity(ctx context.Context, identity string) context.Context {
 	return context.WithValue(ctx, turnIdentityKey{}, identity)
 }
 
+// geminiDraftState is one read of the LOGICAL Quill document. `Text` excludes
+// the structural trailing newline Quill always keeps. `Rendered` is a hint from
+// the visual DOM and must never decide ownership or exactness.
+type geminiDraftState struct {
+	OK     bool   `json:"ok"`
+	Text   string `json:"text"`
+	Marked bool   `json:"marked"`
+	// The in-page token is structured on purpose: a bare boolean would let a
+	// marker on another tab or conversation authorize an overwrite here.
+	MarkedText   string `json:"markedText"`
+	MarkedTarget string `json:"markedTarget"`
+	MarkedThread string `json:"markedThread"`
+	Rendered     int    `json:"rendered"`
+}
+
+// readComposerJS reads the Quill document through the same accessor the fill
+// and verification steps use, so no decision compares two different readings.
+func readComposerJS(composer string) string {
+	return fmt.Sprintf(`(function(){
+var el=document.querySelector(%q), host=el&&el.closest('rich-textarea'), q=host&&host.__quill;
+if(!q||typeof q.getText!=='function')return {ok:false,text:'',marked:false,markedText:'',markedTarget:'',markedThread:'',rendered:0};
+var raw=q.getText(), text=raw.endsWith('\n')?raw.slice(0,-1):raw;
+var m=q.__geminiProxyDraft, mo=(m&&typeof m==='object')?m:null;
+return {ok:true,text:text,marked:!!mo,markedText:mo&&typeof mo.text==='string'?mo.text:'',markedTarget:mo&&typeof mo.target==='string'?mo.target:'',markedThread:mo&&typeof mo.thread==='string'?mo.thread:'',rendered:(el.textContent||'').trim().length};
+})()`, composer)
+}
+
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
+// draftHash is a content fingerprint used ONLY as a diagnostic and as an
+// integrity check on the recorded snapshot. Ownership compares the exact
+// logical document; a truncated digest must never authorize an overwrite.
+func draftHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// draftHashShort is the log-sized form. It is never used for a decision.
+func draftHashShort(s string) string {
+	return draftHash(s)[:8]
+}
+
+// geminiDraftRecord is the Go-side provenance of the document this bridge last
+// left in the composer. Ownership needs all of it: the exact text, its full
+// digest, the adapter identity that asked for it, and the tab and conversation
+// it was written on.
+type geminiDraftRecord struct {
+	Prompt    string
+	Doc       string
+	Hash      string
+	Identity  string
+	Target    string
+	Thread    string
+	Submitted bool
+}
+
+// decideGeminiDraft is the whole ownership rule. `owned` permits replacing the
+// current document; `reuse` means it already is exactly this turn's text.
+// Ownership requires the recorded tab and conversation to match and the
+// document to equal the exact recorded snapshot. The page-scoped marker is
+// corroboration only: on its own, or on a different target/thread, it proves
+// nothing. A user edit, a missing record and an unreadable editor all preserve
+// the draft.
+func decideGeminiDraft(s geminiDraftState, identity, target, thread, prompt string, rec geminiDraftRecord) (owned, reuse bool, why string) {
+	if !s.OK {
+		return false, false, "no-quill"
+	}
+	if s.Text == "" {
+		return true, false, "empty"
+	}
+	if rec.Submitted {
+		return false, false, "submission-attempted"
+	}
+	if rec.Target != "" && rec.Thread != "" && rec.Doc != "" {
+		if rec.Target != target {
+			return false, false, "other-target"
+		}
+		if rec.Thread != thread {
+			return false, false, "other-thread"
+		}
+		if s.Text != rec.Doc || draftHash(rec.Doc) != rec.Hash {
+			return false, false, "unverified-document"
+		}
+	} else {
+		// No Go record: a lost CDP reply leaves a document this bridge did write.
+		// The in-page token is acceptable only because it binds the exact text,
+		// the exact target and the exact conversation; it is never a bare flag.
+		if s.MarkedText == "" || s.MarkedTarget == "" || s.MarkedThread == "" {
+			return false, false, "unverified-document"
+		}
+		if s.MarkedTarget != target {
+			return false, false, "other-target"
+		}
+		if s.MarkedThread != thread {
+			return false, false, "other-thread"
+		}
+		if s.MarkedText != s.Text {
+			return false, false, "unverified-document"
+		}
+	}
+	if rec.Identity != "" && rec.Identity == identity && rec.Prompt == prompt {
+		return true, true, "same-turn"
+	}
+	return true, false, "superseded-owned-draft"
+}
+
 // fillComposerJS updates the genuine Quill document, not DOM textContent.
 // Native Input.insertText triggers extremely slow per-line editor mutation on
 // large catalogs. Quill's user-source update notifies the app in one batch.
 // Always append a structural newline, even when the prompt already ends in one.
-func fillComposerJS(composer, prompt string) string {
+//
+// The mutation is a transaction on the EXACT document Go decided about: `prev`
+// is the logical document that was read when the ownership verdict was made, and
+// a mismatch inside the page means the user edited in between, so the fill
+// refuses instead of overwriting. `owned` is the Go verdict and is re-checked in
+// the page; the marker is set before any reuse, so an early return can never
+// leave an unmarked document that a later Send would not recognise.
+func fillComposerJS(composer, prompt, prev string, owned bool, target string) string {
 	return fmt.Sprintf(`(function(){
 var el=document.querySelector(%q), host=el&&el.closest('rich-textarea'), q=host&&host.__quill;
 if(!q||typeof q.setText!=='function'||typeof q.getText!=='function')return 'no-quill';
-var text=%s, expected=text+'\n', current=q.getText();
-if(current===expected&&q.__geminiProxyDraft===text)return 'reused';
-if(current!=='\n')return 'foreign-draft';
-q.__geminiProxyDraft=text;
+var text=%s, prev=%s, expected=text+'\n', raw=q.getText(), current=raw.endsWith('\n')?raw.slice(0,-1):raw;
+if(current!==prev)return 'changed';
+if(current!==''&&!%t)return 'foreign-draft';
+q.__geminiProxyDraft={text:text,target:%s,thread:location.href};
+if(raw===expected)return 'reused';
 q.setText(expected,'user');
 return q.getText()===expected?'inserted':'identity-mismatch';
-})()`, composer, jsQuote(prompt))
+})()`, composer, jsQuote(prompt), jsQuote(prev), owned, jsQuote(target))
 }
 
 // typeAndSubmitLocked fills, verifies, then separately clicks Send. Insertion
@@ -921,17 +1069,54 @@ func (c *Client) typeAndSubmitLocked(ctx context.Context, prompt string) error {
 		return ErrNoComposer
 	}
 
-	c.draftPrompt = prompt
-	c.draftIdentity, _ = ctx.Value(turnIdentityKey{}).(string)
+	identity, _ := ctx.Value(turnIdentityKey{}).(string)
+	// Bind to the ACTUAL CDP target handling this turn. c.ownedTarget is only
+	// the target this client created, so it is empty for an attached tab.
+	target := string(c.ownedTarget)
+	if tr := chromedp.FromContext(rctx); tr != nil && tr.Target != nil {
+		target = string(tr.Target.TargetID)
+	}
+	var thread string
+	_ = chromedp.Run(rctx, chromedp.Location(&thread))
+	var state geminiDraftState
+	if err := chromedp.Run(rctx, chromedp.Evaluate(readComposerJS(composer), &state)); err != nil {
+		return fmt.Errorf("%w: read composer (%d bytes): %v", ErrNotSubmitted, len(prompt), err)
+	}
+	owned, _, why := decideGeminiDraft(state, identity, target, thread, prompt, geminiDraftRecord{
+		Prompt:    c.draftPrompt,
+		Doc:       c.draftDoc,
+		Hash:      c.draftHash,
+		Identity:  c.draftIdentity,
+		Target:    c.draftTarget,
+		Thread:    c.draftThread,
+		Submitted: c.draftSubmitted,
+	})
+	switch why {
+	case "no-quill":
+		return fmt.Errorf("%w: Quill editor unavailable, nothing typed", ErrNotSubmitted)
+	case "submission-attempted":
+		return fmt.Errorf("%w (reason=%s document_units=%d retryable=false); this chat's draft belongs to a turn that may already have been sent, so it is left untouched", ErrDraftOwned, why, utf16Len(state.Text))
+	case "other-target", "other-thread":
+		log.Printf("[gemini] draft refused reason=%s document_units=%d document_hash=%s prompt_units=%d marked=%v", why, utf16Len(state.Text), draftHashShort(state.Text), utf16Len(prompt), state.Marked)
+		return fmt.Errorf("%w (reason=%s document_units=%d document_hash=%s retryable=false); this draft was written on a different browser tab or conversation, so it is left untouched", ErrForeignDraft, why, utf16Len(state.Text), draftHashShort(state.Text))
+	case "unverified-document":
+		log.Printf("[gemini] draft refused reason=%s document_units=%d document_hash=%s prompt_units=%d marked=%v", why, utf16Len(state.Text), draftHashShort(state.Text), utf16Len(prompt), state.Marked)
+		return fmt.Errorf("%w (reason=%s document_units=%d document_hash=%s prompt_units=%d marked=%v retryable=false); cannot verify who wrote the text currently in this chat, so it is left untouched", ErrForeignDraft, why, utf16Len(state.Text), draftHashShort(state.Text), utf16Len(prompt), state.Marked)
+	}
+	log.Printf("[gemini] draft decision=%s document_units=%d prompt_units=%d marked=%v", why, utf16Len(state.Text), utf16Len(prompt), state.Marked)
 	started := time.Now()
 	var filled string
-	if err := chromedp.Run(rctx, chromedp.Evaluate(fillComposerJS(composer, prompt), &filled)); err != nil {
+	if err := chromedp.Run(rctx, chromedp.Evaluate(fillComposerJS(composer, prompt, state.Text, owned, target), &filled)); err != nil {
 		return fmt.Errorf("%w: Quill input failed (%d bytes, %s): %v", ErrNotSubmitted, len(prompt), time.Since(started).Round(time.Millisecond), err)
 	}
 	log.Printf("[gemini] input bytes=%d stage=quill duration=%s result=%s", len(prompt), time.Since(started).Round(time.Millisecond), filled)
 	if filled != "inserted" && filled != "reused" {
 		return fmt.Errorf("%w: Quill input refused: %s", ErrNotSubmitted, filled)
 	}
+	// Record ownership only once the document really holds our text, so a
+	// failed fill cannot make a later request believe a draft is ours.
+	c.draftPrompt, c.draftIdentity, c.draftHash, c.draftSubmitted = prompt, identity, draftHash(prompt), false
+	c.draftDoc, c.draftTarget, c.draftThread = prompt, target, thread
 
 	// Verify exact Quill document identity, including its structural newline.
 	var holds bool
@@ -951,15 +1136,17 @@ func (c *Client) typeAndSubmitLocked(ctx context.Context, prompt string) error {
 		}
 		var clicked bool
 		err := chromedp.Run(rctx, chromedp.Evaluate(fmt.Sprintf(
-			`(function(){var e=document.querySelector(%q),h=e&&e.closest('rich-textarea'),q=h&&h.__quill;var el=document.querySelector(%q);if(!q||q.__geminiProxyDraft!==%s||q.getText()!==%s+'\n'||!el||el.disabled||el.getAttribute('aria-disabled')==='true')return false;el.click();return true;})()`, composer, sel, jsQuote(prompt), jsQuote(prompt)), &clicked))
+			`(function(){var e=document.querySelector(%q),h=e&&e.closest('rich-textarea'),q=h&&h.__quill;var el=document.querySelector(%q);if(!q||!q.__geminiProxyDraft||typeof q.__geminiProxyDraft!=='object'||q.__geminiProxyDraft.text!==%s||q.getText()!==%s+'\n'||!el||el.disabled||el.getAttribute('aria-disabled')==='true')return false;el.click();return true;})()`, composer, sel, jsQuote(prompt), jsQuote(prompt)), &clicked))
 		if err != nil {
-			c.draftPrompt = "" // click may have happened; never reconcile/retry it
-			c.draftIdentity = ""
+			// The click may have happened: fence the draft rather than dropping
+			// the record, so no later request can reuse or overwrite it.
+			c.draftSubmitted = true
 			return fmt.Errorf("%w: %v", ErrSubmissionUncertain, err)
 		}
 		if clicked {
-			c.draftPrompt = ""
-			c.draftIdentity = ""
+			c.draftSubmitted = true
+			c.draftPrompt, c.draftIdentity, c.draftHash = "", "", ""
+			c.draftDoc, c.draftTarget, c.draftThread = "", "", ""
 			return nil
 		}
 	}
