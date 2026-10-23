@@ -35,6 +35,24 @@ func TestParseBridgeCallOK(t *testing.T) {
 	}
 }
 
+func TestParseBridgeCallStrayQuoteAfterValue(t *testing.T) {
+	// Real model output: an extra quote closes the arguments object. The error
+	// text was `invalid character '"' after object key:value pair`.
+	call, err := ParseBridgeCall(`{"name":"get_weather","arguments":{"city":"Hanoi"}"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.Name != "get_weather" || call.Arguments["city"] != "Hanoi" {
+		t.Fatalf("unexpected call: %+v", call)
+	}
+}
+
+func TestParseBridgeCallStillRejectsOtherMalformedJSON(t *testing.T) {
+	if _, err := ParseBridgeCall(`{"name":"get_weather" "arguments":{"city":"Hanoi"}}`); err == nil {
+		t.Fatal("missing comma must stay invalid")
+	}
+}
+
 func TestParseBridgeCallBadJSON(t *testing.T) {
 	if _, err := ParseBridgeCall(`{not json`); err == nil {
 		t.Fatal("expected error for bad JSON")
