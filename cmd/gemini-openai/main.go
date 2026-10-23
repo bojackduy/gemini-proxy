@@ -859,9 +859,11 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 
 	started := time.Now()
+	log.Printf("[gemini-flow] session=%s stage=request fresh=%v prompt_bytes=%d tools=%d stream=%v", shortSID(sid), fresh, len(toSend), len(req.Tools), req.Stream)
 	log.Printf("[openai] session=%s stage=browser-start fresh=%v prompt_bytes=%d tools=%d", shortSID(sid), fresh, len(toSend), len(req.Tools))
 	answer, images, err := h.askTurn(gemini.WithTurnIdentity(r.Context(), sid+"\x00"+hash), toSend, fresh)
 	if err != nil {
+		log.Printf("[gemini-flow] session=%s stage=browser_result result=error duration=%s not_submitted=%v err=%v", shortSID(sid), time.Since(started).Round(time.Millisecond), errors.Is(err, gemini.ErrNotSubmitted), err)
 		log.Printf("[openai] session=%s stage=browser-failed duration=%s not_submitted=%v", shortSID(sid), time.Since(started).Round(time.Millisecond), errors.Is(err, gemini.ErrNotSubmitted))
 		if errors.Is(err, gemini.ErrNotLoggedIn) || gemini.IsPreSubmit(err) || errors.Is(err, gemini.ErrNoComposer) || gemini.IsNavigateError(err) {
 			h.mu.Lock()
@@ -899,8 +901,10 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate the protocol BEFORE emitting anything (buffered SSE).
+	log.Printf("[gemini-flow] session=%s stage=answer bytes=%d duration=%s", shortSID(sid), len(answer), time.Since(started).Round(time.Millisecond))
 	calls, err := gemini.ExtractExecutableCalls(answer, schemas, choice)
 	if err != nil {
+		log.Printf("[gemini-flow] session=%s stage=protocol_validation result=rejected err=%v", shortSID(sid), err)
 		h.mu.Lock()
 		// The submission completed (an answer arrived) but failed strict
 		// protocol validation: no calls are delivered. The outcome is
@@ -950,6 +954,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[openai] session=%s fresh=%v prompt_bytes=%d tools=%d answer_bytes=%d tool_calls=%d images=%d",
 		shortSID(sid), fresh, len(toSend), len(req.Tools), len(answer), len(toolIDs), len(images))
+	log.Printf("[gemini-flow] session=%s stage=protocol_validation result=accepted tool_calls=%d images=%d", shortSID(sid), len(toolIDs), len(images))
 	h.writeChatResponse(w, &req, h.buildCompletion(&req, answer, images, calls, toolIDs, created, respID))
 }
 
@@ -1031,6 +1036,7 @@ func (h *handler) buildCompletion(req *chatRequest, answer string, images []gemi
 }
 
 func (h *handler) writeChatResponse(w http.ResponseWriter, req *chatRequest, resp *completion) {
+	log.Printf("[gemini-flow] stage=response stream=%v answer_bytes=%d tool_calls=%d", req.Stream, len(streamTextOf(resp.Choices[0].Message.Content)), len(resp.Choices[0].Message.ToolCalls))
 	if req.Stream {
 		// Buffered SSE: emit the validated completion as deltas, then DONE.
 		w.Header().Set("Content-Type", "text/event-stream")
