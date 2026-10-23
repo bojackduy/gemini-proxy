@@ -63,9 +63,25 @@ func ParseBridgeCall(payload string) (*BridgeCall, error) {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
+	var err error
 	dec := json.NewDecoder(strings.NewReader(payload))
-	if err := dec.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("bridge wrapper is not valid JSON: %w", err)
+	if err = dec.Decode(&raw); err != nil {
+		// The model sometimes emits an extra quote after the JSON object;
+		// strip one trailing quote and retry once.
+		stripped := strings.TrimSuffix(strings.TrimSpace(payload), "\"")
+		if stripped != payload {
+			dec2 := json.NewDecoder(strings.NewReader(stripped))
+			if err2 := dec2.Decode(&raw); err2 == nil {
+				err = nil
+			} else {
+				err = fmt.Errorf("bridge wrapper is not valid JSON: %w", err2)
+			}
+		} else {
+			err = fmt.Errorf("bridge wrapper is not valid JSON: %w", err)
+		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(raw.Name) == "" {
 		return nil, fmt.Errorf("bridge wrapper missing function name")
