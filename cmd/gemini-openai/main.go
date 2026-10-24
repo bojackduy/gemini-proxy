@@ -699,7 +699,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		resp := h.buildCompletion(&req, sess.LastAnswer, sess.LastImages, calls, sess.LastToolIDs, sess.LastCreated, sess.LastRespID)
 		h.mu.Unlock()
-		h.writeChatResponse(w, &req, resp)
+		h.writeChatResponse(w, &req, resp, "")
 		return
 	}
 	// Per-session pending guard. An uncertain submission refuses ITS OWN
@@ -956,7 +956,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[openai] session=%s fresh=%v prompt_bytes=%d tools=%d answer_bytes=%d tool_calls=%d images=%d",
 		shortSID(sid), fresh, len(toSend), len(req.Tools), len(answer), len(toolIDs), len(images))
 	log.Printf("[gemini-flow] id=%s session=%s stage=protocol_validation result=accepted tool_calls=%d images=%d", fid, shortSID(sid), len(toolIDs), len(images))
-	h.writeChatResponse(w, &req, h.buildCompletion(&req, answer, images, calls, toolIDs, created, respID))
+	h.writeChatResponse(w, &req, h.buildCompletion(&req, answer, images, calls, toolIDs, created, respID), fid)
 }
 
 // teachReminder names the available functions on continuations (schemas were
@@ -1036,8 +1036,8 @@ func (h *handler) buildCompletion(req *chatRequest, answer string, images []gemi
 		Usage:   map[string]int{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 }
 
-func (h *handler) writeChatResponse(w http.ResponseWriter, req *chatRequest, resp *completion) {
-	log.Printf("[gemini-flow] stage=response stream=%v answer_bytes=%d tool_calls=%d", req.Stream, len(streamTextOf(resp.Choices[0].Message.Content)), len(resp.Choices[0].Message.ToolCalls))
+func (h *handler) writeChatResponse(w http.ResponseWriter, req *chatRequest, resp *completion, fid string) {
+	log.Printf("[gemini-flow] id=%s stage=response stream=%v answer_bytes=%d tool_calls=%d", fid, req.Stream, len(streamTextOf(resp.Choices[0].Message.Content)), len(resp.Choices[0].Message.ToolCalls))
 	if req.Stream {
 		// Buffered SSE: emit the validated completion as deltas, then DONE.
 		w.Header().Set("Content-Type", "text/event-stream")

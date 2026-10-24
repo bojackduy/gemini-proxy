@@ -720,10 +720,14 @@ func (c *Client) askRich(ctx context.Context, prompt string, newSession bool, ti
 			id, err, len(text), len(images), time.Since(started).Round(time.Millisecond))
 	}()
 
+	prepStart := time.Now()
+	log.Printf("[gemini-flow] id=%s stage=prepare start new_session=%v", id, newSession)
 	beforeIDs, err := c.prepareSubmission(ctx, prompt, newSession)
 	if err != nil {
+		log.Printf("[gemini-flow] id=%s stage=prepare result=error duration=%s err=%v", id, time.Since(prepStart).Round(time.Millisecond), err)
 		return "", nil, err
 	}
+	log.Printf("[gemini-flow] id=%s stage=prepare result=ok prior_answers=%d duration=%s", id, len(beforeIDs), time.Since(prepStart).Round(time.Millisecond))
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
