@@ -127,8 +127,8 @@ func TestOperationCleanupPreservesRoots(t *testing.T) {
 func TestFillComposerEncodesEntireLargePrompt(t *testing.T) {
 	prompt := strings.Repeat("public catalog \"quoted\" 日本語\n", 5000) + "\n"
 	script := fillComposerJS(`div.ql-editor`, prompt)
-	if !strings.Contains(script, "var expected="+jsQuote(prompt)) {
-		t.Fatal("prompt was truncated or improperly quoted")
+	if !strings.Contains(script, "var expected="+jsQuote(prompt)+"+'\\n'") {
+		t.Fatal("prompt was truncated, improperly quoted, or lost its structural newline")
 	}
 	for _, required := range []string{"q.setText(expected,'user')", "q.getText()===expected"} {
 		if !strings.Contains(script, required) {

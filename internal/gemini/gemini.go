@@ -1068,7 +1068,7 @@ func fillComposerJS(composer, prompt string) string {
 	return fmt.Sprintf(`(function(){
 var el=document.querySelector(%q), host=el&&el.closest('rich-textarea'), q=host&&host.__quill;
 if(!q||typeof q.setText!=='function'||typeof q.getText!=='function')return 'no-quill';
-var expected=%s;
+var expected=%s+'\n';
 if(q.getText()===expected)return 'reused';
 q.setText(expected,'user');
 return 'inserted';

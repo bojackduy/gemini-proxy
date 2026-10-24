@@ -30,7 +30,7 @@ func TestComposer(t *testing.T) {
 	c := &Client{tab: tab}
 	fixture := `document.body.innerHTML='<rich-textarea><div class="ql-editor" role="textbox" contenteditable="true"></div></rich-textarea><button class="send-button">Send</button>';
 window.sends=0;window.documentText='\n';
-document.querySelector('button').onclick=()=>window.sends++;
+document.querySelector('button').onclick=()=>{window.submittedText=window.documentText;window.sends++;window.documentText='\n';};
 document.querySelector('rich-textarea').__quill={getText:()=>window.documentText,setText:(t,s)=>{if(s!=='user')throw Error('wrong source');window.documentText=t;}};`
 	reset := func() {
 		t.Helper()
@@ -52,8 +52,8 @@ document.querySelector('rich-textarea').__quill={getText:()=>window.documentText
 		if err := c.typeAndSubmitLocked(context.Background(), prompt); err != nil {
 			t.Fatal(err)
 		}
-		if read("window.sends") != 1 || read("window.documentText.length") != len(prompt)+1 {
-			t.Fatal("lost input or duplicate send")
+		if gotSends, gotLen := read("window.sends"), read("window.submittedText.length"); gotSends != 1 || gotLen != len(prompt)+1 {
+			t.Fatalf("lost input or duplicate send: sends=%d submitted=%d want=%d", gotSends, gotLen, len(prompt)+1)
 		}
 	})
 	t.Run("leftover-exact-draft-is-reused-and-sent-once", func(t *testing.T) {
@@ -70,7 +70,7 @@ document.querySelector('rich-textarea').__quill={getText:()=>window.documentText
 		if err := c.typeAndSubmitLocked(context.Background(), prompt); err != nil {
 			t.Fatal(err)
 		}
-		if read("window.sends") != 1 || read("window.documentText.length") != len(prompt)+1 {
+		if read("window.sends") != 1 || read("window.submittedText.length") != len(prompt)+1 {
 			t.Fatal("retry appended or double-submitted")
 		}
 	})
@@ -83,7 +83,7 @@ document.querySelector('rich-textarea').__quill={getText:()=>window.documentText
 		if err := c.typeAndSubmitLocked(context.Background(), prompt); err != nil {
 			t.Fatal(err)
 		}
-		if read("window.sends") != 1 || read("window.documentText.length") != len(prompt)+1 {
+		if read("window.sends") != 1 || read("window.submittedText.length") != len(prompt)+1 {
 			t.Fatal("foreign draft was not replaced and sent")
 		}
 	})
