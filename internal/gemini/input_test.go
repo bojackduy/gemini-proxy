@@ -2,27 +2,14 @@ package gemini
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestAttemptedDraftCannotCrossAdapterRequests(t *testing.T) {
-	c := &Client{draftPrompt: "same text", draftIdentity: "session-A/request-1", draftHash: draftHash("same text"), draftSubmitted: true}
-	for _, identity := range []string{"session-B/request-1", "session-A/request-2"} {
-		_, err := c.Ask(WithTurnIdentity(context.Background(), identity), "same text", true, time.Second)
-		if !errors.Is(err, ErrDraftOwned) {
-			t.Fatalf("attempted draft crossed adapter requests: %v", err)
-		}
-		if c.draftPrompt != "same text" || !c.draftSubmitted {
-			t.Fatal("attempted draft record discarded")
-		}
-	}
-}
-
-// TestDecideGeminiDraftOwnership pins the Quill ownership table without a
-// browser: every branch that can erase or preserve text is decided here.
+// Fire-and-forget: a leftover draft from an earlier attempt is overwritten,
+// never refused. The ownership table below is retained only as dead reference
+// for the removed gate; it is no longer consulted by the ask path.
 func TestDecideGeminiDraftOwnership(t *testing.T) {
 	const prompt = "the prompt we typed"
 	const target = "T1"
@@ -139,36 +126,21 @@ func TestOperationCleanupPreservesRoots(t *testing.T) {
 
 func TestFillComposerEncodesEntireLargePrompt(t *testing.T) {
 	prompt := strings.Repeat("public catalog \"quoted\" 日本語\n", 5000) + "\n"
-	script := fillComposerJS(`div.ql-editor`, prompt, "", true, "T1")
-	if !strings.Contains(script, "var text="+jsQuote(prompt)) {
+	script := fillComposerJS(`div.ql-editor`, prompt)
+	if !strings.Contains(script, "var expected="+jsQuote(prompt)) {
 		t.Fatal("prompt was truncated or improperly quoted")
 	}
-	for _, required := range []string{"q.setText(expected,'user')", "expected=text+'\\n'", "q.getText()===expected", "q.__geminiProxyDraft={text:text,target:", "current!==''", "if(current!==prev)return 'changed'"} {
+	for _, required := range []string{"q.setText(expected,'user')", "q.getText()===expected"} {
 		if !strings.Contains(script, required) {
-			t.Fatalf("missing guard %q", required)
+			t.Fatalf("missing step %q", required)
 		}
 	}
-	// The exact document Go decided about is part of the in-page transaction:
-	// an edit between the Go read and this mutation refuses instead of losing it.
-	prev := "text the user typed between the read and the fill"
-	guarded := fillComposerJS(`div.ql-editor`, prompt, prev, true, "T1")
-	if !strings.Contains(guarded, "var text="+jsQuote(prompt)+", prev="+jsQuote(prev)) {
-		t.Fatal("previous logical document is not revalidated in the page")
-	}
-	// The marker is set before the early return, so a reused document is never
-	// left unmarked for a later Send.
-	if strings.Index(script, "q.__geminiProxyDraft={text:text,target:") > strings.Index(script, "if(raw===expected)return 'reused'") {
-		t.Fatal("marker is not set before the reuse early return")
-	}
-	// The Go-side ownership verdict is a hard gate inside the page too: without
-	// it a non-empty document is never overwritten.
-	unowned := fillComposerJS(`div.ql-editor`, prompt, prev, false, "T1")
-	if !strings.Contains(unowned, "return 'foreign-draft'") || strings.Contains(unowned, "current!==''&&!true") {
-		t.Fatalf("unowned fill must refuse a non-empty document: %s", unowned)
-	}
-	for _, forbidden := range []string{".click(", "textContent=", "innerHTML=", "setTimeout", "clipboard"} {
+	// Fire and forget: the script must not revalidate an earlier document, refuse
+	// a foreign draft, or verify the write afterwards.
+	for _, forbidden := range []string{"prev", "foreign-draft", "identity-mismatch", "changed", "__geminiProxyDraft",
+		".click(", "textContent=", "innerHTML=", "setTimeout", "clipboard"} {
 		if strings.Contains(script, forbidden) {
-			t.Fatalf("unsafe input side effect %q", forbidden)
+			t.Fatalf("fire-and-forget fill still contains %q: %s", forbidden, script)
 		}
 	}
 }

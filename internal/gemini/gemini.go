@@ -699,7 +699,7 @@ func (c *Client) AskWithImages(ctx context.Context, prompt string, newSession bo
 // askRich is the shared submit-and-wait flow for Ask/AskWithImages.
 // With collectImages it additionally resolves image bytes read-only after
 // the answer stabilizes; without it the behavior is exactly Ask's.
-func (c *Client) askRich(ctx context.Context, prompt string, newSession bool, timeout time.Duration, collectImages bool) (string, []ResponseImage, error) {
+func (c *Client) askRich(ctx context.Context, prompt string, newSession bool, timeout time.Duration, collectImages bool) (text string, images []ResponseImage, err error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", nil, errors.New("prompt must not be empty")
 	}
@@ -708,6 +708,17 @@ func (c *Client) askRich(ctx context.Context, prompt string, newSession bool, ti
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	id := flowID(ctx)
+	if id == "" {
+		id = NewFlowID()
+		ctx = WithFlowID(ctx, id)
+	}
+	started := time.Now()
+	log.Printf("[gemini-flow] id=%s stage=start prompt_bytes=%d new_session=%v timeout=%s", id, len(prompt), newSession, timeout)
+	defer func() {
+		log.Printf("[gemini-flow] id=%s stage=finish err=%v answer_bytes=%d images=%d duration=%s",
+			id, err, len(text), len(images), time.Since(started).Round(time.Millisecond))
+	}()
 
 	beforeIDs, err := c.prepareSubmission(ctx, prompt, newSession)
 	if err != nil {
@@ -756,16 +767,7 @@ func (c *Client) prepareSubmission(ctx context.Context, prompt string, newSessio
 	submissionReady := false
 	var lastErr error
 	for attempt := 0; attempt < 2 && !submissionReady; attempt++ {
-		c.mu.Lock()
-		pendingDraft := c.draftPrompt
-		pendingSubmitted := c.draftSubmitted
-		c.mu.Unlock()
-		if pendingDraft != "" && pendingSubmitted {
-			// An attempted turn's draft is evidence, not scratch space. It is
-			// never replaced automatically, and retrying cannot fix that.
-			return nil, fmt.Errorf("%w: an earlier turn's draft may already have been sent, so it is left untouched", ErrDraftOwned)
-		}
-		if err := c.prepareTurn(ctx, newSession && pendingDraft == ""); err != nil {
+		if err := c.prepareTurn(ctx, newSession); err != nil {
 			lastErr = err
 			if ctx.Err() != nil {
 				return nil, fmt.Errorf("%w: prepare canceled: %v", ErrNotSubmitted, ctx.Err())
@@ -906,6 +908,36 @@ func operationContext(tab, caller context.Context, budget time.Duration) (contex
 
 type turnIdentityKey struct{}
 
+type flowIDKey struct{}
+
+// flowID names one browser turn in the flow log so a whole request can be read
+// as a timeline. Empty when the caller is not an ask.
+func flowID(ctx context.Context) string {
+	id, _ := ctx.Value(flowIDKey{}).(string)
+	return id
+}
+
+// NewFlowID names one browser turn in the flow log. The adapter creates it so
+// its own request line and every browser stage share a single id.
+func NewFlowID() string {
+	return fmt.Sprintf("gemini-%x", time.Now().UnixNano())
+}
+
+// WithFlowID pins a caller-created flow id. Plain MCP calls omit it and askRich
+// makes one.
+func WithFlowID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, flowIDKey{}, id)
+}
+
+// jsStringArray renders a Go slice as a JavaScript string array literal.
+func jsStringArray(items []string) string {
+	parts := make([]string, len(items))
+	for i, item := range items {
+		parts[i] = jsQuote(item)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
 // WithTurnIdentity binds an adapter retry to both its session and exact request.
 // Plain MCP Ask calls retain their existing single-consumer behavior.
 func WithTurnIdentity(ctx context.Context, identity string) context.Context {
@@ -1025,30 +1057,27 @@ func decideGeminiDraft(s geminiDraftState, identity, target, thread, prompt stri
 // large catalogs. Quill's user-source update notifies the app in one batch.
 // Always append a structural newline, even when the prompt already ends in one.
 //
-// The mutation is a transaction on the EXACT document Go decided about: `prev`
-// is the logical document that was read when the ownership verdict was made, and
-// a mismatch inside the page means the user edited in between, so the fill
-// refuses instead of overwriting. `owned` is the Go verdict and is re-checked in
-// the page; the marker is set before any reuse, so an early return can never
-// leave an unmarked document that a later Send would not recognise.
-func fillComposerJS(composer, prompt, prev string, owned bool, target string) string {
+// Fire and forget: the document is written and nothing is verified afterwards.
+// Whatever the editor holds is what Send will submit, so a stale draft is
+// replaced and a partial write may be sent. That tradeoff is deliberate.
+func fillComposerJS(composer, prompt string) string {
 	return fmt.Sprintf(`(function(){
 var el=document.querySelector(%q), host=el&&el.closest('rich-textarea'), q=host&&host.__quill;
 if(!q||typeof q.setText!=='function'||typeof q.getText!=='function')return 'no-quill';
-var text=%s, prev=%s, expected=text+'\n', raw=q.getText(), current=raw.endsWith('\n')?raw.slice(0,-1):raw;
-if(current!==prev)return 'changed';
-if(current!==''&&!%t)return 'foreign-draft';
-q.__geminiProxyDraft={text:text,target:%s,thread:location.href};
-if(raw===expected)return 'reused';
+var expected=%s;
+if(q.getText()===expected)return 'reused';
 q.setText(expected,'user');
-return q.getText()===expected?'inserted':'identity-mismatch';
-})()`, composer, jsQuote(prompt), jsQuote(prev), owned, jsQuote(target))
+return 'inserted';
+})()`, composer, jsQuote(prompt))
 }
 
-// typeAndSubmitLocked fills, verifies, then separately clicks Send. Insertion
-// never submits, even if its CDP reply arrives after cancellation. A retry can
-// reuse only the exact document bearing our ownership marker; no blind clears.
+// typeAndSubmitLocked fills the composer and clicks Send. Nothing is verified:
+// the document is never compared with the prompt, the click never re-checks the
+// editor, and readiness only asks whether the Send control is enabled. The read
+// and the click are separate calls so a slow renderer cannot turn a click that
+// never happened into an uncertain turn.
 func (c *Client) typeAndSubmitLocked(ctx context.Context, prompt string) error {
+	id := flowID(ctx)
 	rctx, cancel := operationContext(c.tab, ctx, 60*time.Second)
 	defer cancel()
 	// Gemini code-block reveal animations can remain pending in a hidden tab.
@@ -1058,6 +1087,7 @@ func (c *Client) typeAndSubmitLocked(ctx context.Context, prompt string) error {
 		return fmt.Errorf("%w: emulate owned-tab focus: %v", ErrNotSubmitted, err)
 	}
 
+	log.Printf("[gemini-flow] id=%s stage=composer_wait start prompt_bytes=%d", id, len(prompt))
 	composer := ""
 	for _, sel := range composerSelectors {
 		if c.jsBool(rctx, fmt.Sprintf(`!!document.querySelector(%q)`, sel)) {
@@ -1066,67 +1096,59 @@ func (c *Client) typeAndSubmitLocked(ctx context.Context, prompt string) error {
 		}
 	}
 	if composer == "" {
+		log.Printf("[gemini-flow] id=%s stage=composer_focus result=missing", id)
 		return ErrNoComposer
 	}
+	log.Printf("[gemini-flow] id=%s stage=composer_focus result=ok", id)
 
-	identity, _ := ctx.Value(turnIdentityKey{}).(string)
-	// Bind to the ACTUAL CDP target handling this turn. c.ownedTarget is only
-	// the target this client created, so it is empty for an attached tab.
-	target := string(c.ownedTarget)
-	if tr := chromedp.FromContext(rctx); tr != nil && tr.Target != nil {
-		target = string(tr.Target.TargetID)
-	}
-	var thread string
-	_ = chromedp.Run(rctx, chromedp.Location(&thread))
-	var state geminiDraftState
-	if err := chromedp.Run(rctx, chromedp.Evaluate(readComposerJS(composer), &state)); err != nil {
-		return fmt.Errorf("%w: read composer (%d bytes): %v", ErrNotSubmitted, len(prompt), err)
-	}
-	owned, _, why := decideGeminiDraft(state, identity, target, thread, prompt, geminiDraftRecord{
-		Prompt:    c.draftPrompt,
-		Doc:       c.draftDoc,
-		Hash:      c.draftHash,
-		Identity:  c.draftIdentity,
-		Target:    c.draftTarget,
-		Thread:    c.draftThread,
-		Submitted: c.draftSubmitted,
-	})
-	switch why {
-	case "no-quill":
-		return fmt.Errorf("%w: Quill editor unavailable, nothing typed", ErrNotSubmitted)
-	case "submission-attempted":
-		return fmt.Errorf("%w (reason=%s document_units=%d retryable=false); this chat's draft belongs to a turn that may already have been sent, so it is left untouched", ErrDraftOwned, why, utf16Len(state.Text))
-	case "other-target", "other-thread":
-		log.Printf("[gemini] draft refused reason=%s document_units=%d document_hash=%s prompt_units=%d marked=%v", why, utf16Len(state.Text), draftHashShort(state.Text), utf16Len(prompt), state.Marked)
-		return fmt.Errorf("%w (reason=%s document_units=%d document_hash=%s retryable=false); this draft was written on a different browser tab or conversation, so it is left untouched", ErrForeignDraft, why, utf16Len(state.Text), draftHashShort(state.Text))
-	case "unverified-document":
-		log.Printf("[gemini] draft refused reason=%s document_units=%d document_hash=%s prompt_units=%d marked=%v", why, utf16Len(state.Text), draftHashShort(state.Text), utf16Len(prompt), state.Marked)
-		return fmt.Errorf("%w (reason=%s document_units=%d document_hash=%s prompt_units=%d marked=%v retryable=false); cannot verify who wrote the text currently in this chat, so it is left untouched", ErrForeignDraft, why, utf16Len(state.Text), draftHashShort(state.Text), utf16Len(prompt), state.Marked)
-	}
-	log.Printf("[gemini] draft decision=%s document_units=%d prompt_units=%d marked=%v", why, utf16Len(state.Text), utf16Len(prompt), state.Marked)
 	started := time.Now()
 	var filled string
-	if err := chromedp.Run(rctx, chromedp.Evaluate(fillComposerJS(composer, prompt, state.Text, owned, target), &filled)); err != nil {
+	if err := chromedp.Run(rctx, chromedp.Evaluate(fillComposerJS(composer, prompt), &filled)); err != nil {
+		log.Printf("[gemini-flow] id=%s stage=composer_insert result=error err=%v", id, err)
 		return fmt.Errorf("%w: Quill input failed (%d bytes, %s): %v", ErrNotSubmitted, len(prompt), time.Since(started).Round(time.Millisecond), err)
 	}
-	log.Printf("[gemini] input bytes=%d stage=quill duration=%s result=%s", len(prompt), time.Since(started).Round(time.Millisecond), filled)
-	if filled != "inserted" && filled != "reused" {
-		return fmt.Errorf("%w: Quill input refused: %s", ErrNotSubmitted, filled)
-	}
-	// Record ownership only once the document really holds our text, so a
-	// failed fill cannot make a later request believe a draft is ours.
-	c.draftPrompt, c.draftIdentity, c.draftHash, c.draftSubmitted = prompt, identity, draftHash(prompt), false
-	c.draftDoc, c.draftTarget, c.draftThread = prompt, target, thread
-
-	// Verify exact Quill document identity, including its structural newline.
-	var holds bool
-	_ = chromedp.Run(rctx, chromedp.Evaluate(fmt.Sprintf(
-		`(function(){var el=document.querySelector(%q);if(!el)return false;var host=el.closest('rich-textarea');var q=host&&host.__quill;return !!q&&q.getText()===%s+'\n';})()`,
-		composer, jsQuote(prompt)), &holds))
-	if !holds {
-		return fmt.Errorf("%w: composer verification failed, refusing to submit", ErrNotSubmitted)
+	log.Printf("[gemini-flow] id=%s stage=composer_insert result=%s bytes=%d duration=%s", id, filled, len(prompt), time.Since(started).Round(time.Millisecond))
+	if filled == "no-quill" {
+		return fmt.Errorf("%w: Quill editor unavailable, nothing typed", ErrNotSubmitted)
 	}
 
+	// Phase 1 only READS whether a Send control is enabled. A large Quill
+	// update can block the renderer for seconds, so this gets its own budget.
+	// Nothing is dispatched here: failing it is provably pre-send.
+	readyJS := fmt.Sprintf(`(function(){var sels=%s;for(var i=0;i<sels.length;i++){var e=document.querySelector(sels[i]);if(e&&!e.disabled&&e.getAttribute('aria-disabled')!=='true')return true;}return false;})()`, jsStringArray(sendSelectors))
+	sendJS := func(sel string) string {
+		return fmt.Sprintf(`(function(){var e=document.querySelector(%q);if(!e||e.disabled||e.getAttribute('aria-disabled')==='true')return false;e.click();return true;})()`, sel)
+	}
+	log.Printf("[gemini-flow] id=%s stage=send_wait start", id)
+	readyStart := time.Now()
+	readyDeadline := time.Now().Add(30 * time.Second)
+	var lastRead error
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: canceled before Send: %v", ErrNotSubmitted, err)
+		}
+		probe, cancelProbe := operationContext(c.tab, ctx, 10*time.Second)
+		var enabled bool
+		err := chromedp.Run(probe, chromedp.Evaluate(readyJS, &enabled))
+		cancelProbe()
+		if err == nil && enabled {
+			log.Printf("[gemini-flow] id=%s stage=send_ready enabled=true waited=%s", id, time.Since(readyStart).Round(time.Millisecond))
+			break
+		}
+		lastRead = err
+		if time.Now().After(readyDeadline) {
+			log.Printf("[gemini-flow] id=%s stage=send_ready enabled=false waited=%s last_err=%v", id, time.Since(readyStart).Round(time.Millisecond), lastRead)
+			return fmt.Errorf("%w: Send control never became enabled after %s with %d bytes inserted; nothing was submitted",
+				ErrNotSubmitted, time.Since(readyStart).Round(time.Millisecond), len(prompt))
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: canceled before Send: %v", ErrNotSubmitted, ctx.Err())
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	// Phase 2: dispatch exactly once. Only a failure here can be uncertain.
 	for _, sel := range sendSelectors {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("%w: canceled before Send: %v", ErrNotSubmitted, err)
@@ -1134,19 +1156,18 @@ func (c *Client) typeAndSubmitLocked(ctx context.Context, prompt string) error {
 		if !c.jsBool(rctx, fmt.Sprintf(`(function(){var e=document.querySelector(%q);return !!e&&!e.disabled&&e.getAttribute('aria-disabled')!=='true';})()`, sel)) {
 			continue
 		}
+		clickCtx, cancelClick := operationContext(c.tab, ctx, 15*time.Second)
 		var clicked bool
-		err := chromedp.Run(rctx, chromedp.Evaluate(fmt.Sprintf(
-			`(function(){var e=document.querySelector(%q),h=e&&e.closest('rich-textarea'),q=h&&h.__quill;var el=document.querySelector(%q);if(!q||!q.__geminiProxyDraft||typeof q.__geminiProxyDraft!=='object'||q.__geminiProxyDraft.text!==%s||q.getText()!==%s+'\n'||!el||el.disabled||el.getAttribute('aria-disabled')==='true')return false;el.click();return true;})()`, composer, sel, jsQuote(prompt), jsQuote(prompt)), &clicked))
+		err := chromedp.Run(clickCtx, chromedp.Evaluate(sendJS(sel), &clicked))
+		cancelClick()
+		log.Printf("[gemini-flow] id=%s stage=send_click selector=%s clicked=%v err=%v", id, sel, clicked, err)
 		if err != nil {
-			// The click may have happened: fence the draft rather than dropping
-			// the record, so no later request can reuse or overwrite it.
-			c.draftSubmitted = true
+			// The click may have happened: keep the turn uncertain so nothing
+			// resends automatically.
 			return fmt.Errorf("%w: %v", ErrSubmissionUncertain, err)
 		}
 		if clicked {
-			c.draftSubmitted = true
-			c.draftPrompt, c.draftIdentity, c.draftHash = "", "", ""
-			c.draftDoc, c.draftTarget, c.draftThread = "", "", ""
+			log.Printf("[gemini-flow] id=%s stage=submitted", id)
 			return nil
 		}
 	}
@@ -1156,21 +1177,29 @@ func (c *Client) typeAndSubmitLocked(ctx context.Context, prompt string) error {
 // waitForAnswerLocked polls until generation finishes and returns the newest
 // model-response outerHTML. Callers must hold c.mu.
 func (c *Client) waitForAnswerLocked(ctx context.Context, before map[string]bool) (string, error) {
+	id := flowID(ctx)
+	log.Printf("[gemini-flow] id=%s stage=stream_wait start", id)
 	ticker := time.NewTicker(1500 * time.Millisecond)
 	defer ticker.Stop()
 	var lastStable string
 	stableRounds := 0
+	lastLogged := -1
 	for {
 		select {
 		case <-ctx.Done():
 			return "", fmt.Errorf("%w: %v", ErrNoResponse, ctx.Err())
 		case <-ticker.C:
 			rctx, cancel := operationContext(c.tab, ctx, 15*time.Second)
+			id := flowID(ctx)
 			generating := c.anyPresent(rctx, stopSelectors)
-			id := c.jsString(rctx, `(function(){var n=document.querySelectorAll('model-response message-content[id]');return n.length?n[n.length-1].id:'';})()`)
+			msgID := c.jsString(rctx, `(function(){var n=document.querySelectorAll('model-response message-content[id]');return n.length?n[n.length-1].id:'';})()`)
 			html := c.jsString(rctx, newestModelResponseJS)
 			cancel()
-			if html == "" || generating || id == "" || before[id] {
+			if len(html) != lastLogged {
+				lastLogged = len(html)
+				log.Printf("[gemini-flow] id=%s stage=stream_poll answer_bytes=%d generating=%v", id, len(html), generating)
+			}
+			if html == "" || generating || msgID == "" || before[msgID] {
 				stableRounds = 0
 				lastStable = html
 				continue

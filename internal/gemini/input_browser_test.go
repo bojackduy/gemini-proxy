@@ -37,8 +37,6 @@ document.querySelector('rich-textarea').__quill={getText:()=>window.documentText
 		if err := chromedp.Run(tab, chromedp.Evaluate(fixture, nil)); err != nil {
 			t.Fatal(err)
 		}
-		c.draftPrompt, c.draftHash, c.draftSubmitted = "", "", false
-		c.draftDoc, c.draftTarget, c.draftThread = "", "", ""
 	}
 	read := func(expr string) int {
 		t.Helper()
@@ -58,20 +56,17 @@ document.querySelector('rich-textarea').__quill={getText:()=>window.documentText
 			t.Fatal("lost input or duplicate send")
 		}
 	})
-	t.Run("owned-post-timeout-retry", func(t *testing.T) {
+	t.Run("leftover-exact-draft-is-reused-and-sent-once", func(t *testing.T) {
 		reset()
+		// A previous attempt left exactly our text in the composer (lost CDP
+		// reply). The retry must not append a second copy and must not double-send.
 		var result string
-		if err := chromedp.Run(tab, chromedp.Evaluate(fillComposerJS(".ql-editor", prompt, "", true, string(chromedp.FromContext(tab).Target.TargetID)), &result)); err != nil {
+		if err := chromedp.Run(tab, chromedp.Evaluate(fillComposerJS(".ql-editor", prompt), &result)); err != nil {
 			t.Fatal(err)
 		}
-		// Insertion completed after a hypothetical lost CDP reply.
-		var thread string
-		if err := chromedp.Run(tab, chromedp.Location(&thread)); err != nil {
-			t.Fatal(err)
+		if result != "inserted" {
+			t.Fatalf("first fill = %q", result)
 		}
-		tid := string(chromedp.FromContext(tab).Target.TargetID)
-		c.draftPrompt, c.draftHash, c.draftDoc = prompt, draftHash(prompt), prompt
-		c.draftTarget, c.draftThread = tid, thread
 		if err := c.typeAndSubmitLocked(context.Background(), prompt); err != nil {
 			t.Fatal(err)
 		}
@@ -79,39 +74,17 @@ document.querySelector('rich-textarea').__quill={getText:()=>window.documentText
 			t.Fatal("retry appended or double-submitted")
 		}
 	})
-	t.Run("foreign-exact-draft", func(t *testing.T) {
+	t.Run("foreign-draft-is-overwritten-and-sent", func(t *testing.T) {
 		reset()
-		if err := chromedp.Run(tab, chromedp.Evaluate("window.documentText="+jsQuote(prompt+"\n"), nil)); err != nil {
+		// Fire and forget: text the bridge did not write is replaced, not refused.
+		if err := chromedp.Run(tab, chromedp.Evaluate("window.documentText="+jsQuote("text the user typed\n"), nil)); err != nil {
 			t.Fatal(err)
 		}
-		if err := c.typeAndSubmitLocked(context.Background(), prompt); !errors.Is(err, ErrForeignDraft) {
-			t.Fatalf("%v", err)
-		}
-		if read("window.sends") != 0 {
-			t.Fatal("sent foreign draft")
-		}
-	})
-	t.Run("edit-between-read-and-fill-preserves-the-draft", func(t *testing.T) {
-		reset()
-		// Go read an empty composer and decided it was free to type. The user
-		// edits before the page mutation lands; the in-page transaction must
-		// revalidate the exact previous document and refuse.
-		userText := "text the user typed just now\n"
-		if err := chromedp.Run(tab, chromedp.Evaluate("window.documentText="+jsQuote(userText), nil)); err != nil {
+		if err := c.typeAndSubmitLocked(context.Background(), prompt); err != nil {
 			t.Fatal(err)
 		}
-		var result string
-		if err := chromedp.Run(tab, chromedp.Evaluate(fillComposerJS(".ql-editor", prompt, "", true, string(chromedp.FromContext(tab).Target.TargetID)), &result)); err != nil {
-			t.Fatal(err)
-		}
-		if result != "changed" {
-			t.Fatalf("fill did not refuse the changed document: %q", result)
-		}
-		if got := read("window.documentText.length"); got != len(userText) {
-			t.Fatalf("user draft was overwritten: %d units", got)
-		}
-		if read("window.sends") != 0 {
-			t.Fatal("sent a draft that changed under the bridge")
+		if read("window.sends") != 1 || read("window.documentText.length") != len(prompt)+1 {
+			t.Fatal("foreign draft was not replaced and sent")
 		}
 	})
 	t.Run("canceled-no-send-tab-survives", func(t *testing.T) {
