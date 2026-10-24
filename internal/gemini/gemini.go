@@ -1172,6 +1172,32 @@ func (c *Client) typeAndSubmitLocked(ctx context.Context, prompt string) error {
 		}
 		if clicked {
 			log.Printf("[gemini-flow] id=%s stage=submitted", id)
+			// Phase 3: observe only. The composer clearing or a generating
+			// indicator is proof the turn reached the thread. Nothing is
+			// refused on a miss: the answer wait stays the authority, and this
+			// is a breadcrumb for a click that never became a turn.
+			observeStart := time.Now()
+			observeDeadline := time.Now().Add(10 * time.Second)
+			retries := 0
+			for time.Now().Before(observeDeadline) {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(700 * time.Millisecond):
+				}
+				retries++
+				octx, ocancel := operationContext(c.tab, ctx, 3*time.Second)
+				empty := c.jsBool(octx, fmt.Sprintf(`(function(){var el=document.querySelector(%q),h=el&&el.closest('rich-textarea'),q=h&&h.__quill;return !!q&&q.getText().trim()==='';})()`, composer))
+				generating := c.anyPresent(octx, stopSelectors)
+				ocancel()
+				if empty || generating {
+					log.Printf("[gemini-flow] id=%s stage=send_observed result=submitted retries=%d waited=%s",
+						id, retries, time.Since(observeStart).Round(time.Millisecond))
+					return nil
+				}
+			}
+			log.Printf("[gemini-flow] id=%s stage=send_observed result=unobserved retries=%d waited=%s composer_still_holds_text=true",
+				id, retries, time.Since(observeStart).Round(time.Millisecond))
 			return nil
 		}
 	}
