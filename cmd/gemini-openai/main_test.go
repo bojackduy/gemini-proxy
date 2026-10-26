@@ -36,8 +36,14 @@ func TestBestEffortPendingContinuationWithoutReadback(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			reads := 0
 			fake := &fakeRecoveryBackend{askAnswer: "fresh answer", urlNow: "https://gemini.google.com/app/NEW"}
-			fake.readTurn = func(string, string) (gemini.TurnResult, error) { reads++; return gemini.TurnResult{}, structuralMismatch() }
-			fake.readLatest = func(string) (string, gemini.TurnResult, error) { reads++; return "", gemini.TurnResult{}, errors.New("unavailable") }
+			fake.readTurn = func(string, string) (gemini.TurnResult, error) {
+				reads++
+				return gemini.TurnResult{}, structuralMismatch()
+			}
+			fake.readLatest = func(string) (string, gemini.TurnResult, error) {
+				reads++
+				return "", gemini.TurnResult{}, errors.New("unavailable")
+			}
 			pending := []message{{Role: "user", Content: "uncertain request"}}
 			stored := []message(nil)
 			if hasHistory {
@@ -62,8 +68,14 @@ func TestBestEffortPendingContinuationWithoutReadback(t *testing.T) {
 func TestBestEffortIdenticalPendingRetryNeverSubmits(t *testing.T) {
 	reads := 0
 	fake := &fakeRecoveryBackend{askAnswer: "must not send"}
-	fake.readTurn = func(string, string) (gemini.TurnResult, error) { reads++; return gemini.TurnResult{}, structuralMismatch() }
-	fake.readLatest = func(string) (string, gemini.TurnResult, error) { reads++; return "", gemini.TurnResult{}, errors.New("unavailable") }
+	fake.readTurn = func(string, string) (gemini.TurnResult, error) {
+		reads++
+		return gemini.TurnResult{}, structuralMismatch()
+	}
+	fake.readLatest = func(string) (string, gemini.TurnResult, error) {
+		reads++
+		return "", gemini.TurnResult{}, errors.New("unavailable")
+	}
 	pending := []message{{Role: "user", Content: "uncertain request"}}
 	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
 		sessions: map[string]*session{"s": {Pending: true, PendingPrompt: "pending prompt", PendingMessages: pending, URL: "https://gemini.google.com/app/OLD"}}}
@@ -1328,4 +1340,63 @@ func TestDraftRefusalMappingIsNonRetryable(t *testing.T) {
 			t.Fatalf("transport failure: %d %s", w.Code, w.Body.String())
 		}
 	})
+}
+
+func TestSessionStateInspector(t *testing.T) {
+	get := func(h *handler, sid string, method string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "/v1/sessions/state", nil)
+		if sid != "" {
+			r.Header.Set("x-opencode-session-id", sid)
+		}
+		w := httptest.NewRecorder()
+		h.routes().ServeHTTP(w, r)
+		return w
+	}
+	decode := func(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+		t.Helper()
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("state body is not JSON: %v", err)
+		}
+		return body
+	}
+	newH := func(sessions map[string]*session) *handler {
+		return &handler{model: "gemini-web", client: &fakeReadyBackend{}, gate: make(chan struct{}, 1), sessions: sessions}
+	}
+
+	if w := get(newH(map[string]*session{}), "", "GET"); w.Code != http.StatusBadRequest {
+		t.Fatalf("missing session header must be 400, got %d", w.Code)
+	}
+	if w := get(newH(map[string]*session{}), "s", "POST"); w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("state requires GET, got %d", w.Code)
+	}
+
+	body := decode(t, get(newH(map[string]*session{}), "nope", "GET"))
+	if body["state"] != "unknown_session" || len(body["actions"].([]any)) != 0 {
+		t.Fatalf("unknown session misreported: %v", body)
+	}
+
+	body = decode(t, get(newH(map[string]*session{"s": {Messages: []message{{Role: "user", Content: "hi"}}}}), "s", "GET"))
+	if body["state"] != "clean" {
+		t.Fatalf("clean session misreported: %v", body)
+	}
+
+	pending := &session{
+		Pending: true, URL: "https://gemini.google.com/app/THREAD",
+		PendingPrompt: "secret-prompt-bytes", PendingMessages: []message{{Role: "user", Content: "uncertain"}},
+		Messages: []message{{Role: "user", Content: "hi"}},
+	}
+	w := get(newH(map[string]*session{"s": pending}), "s", "GET")
+	body = decode(t, w)
+	if body["state"] != "pending" || body["pending_prompt_bytes"].(float64) == 0 || body["thread_url_present"] != true {
+		t.Fatalf("pending session misreported: %v", body)
+	}
+	if strings.Contains(w.Body.String(), "secret-prompt-bytes") {
+		t.Fatal("state inspector leaked prompt text")
+	}
+
+	body = decode(t, get(newH(map[string]*session{"s": {Pending: true}}), "s", "GET"))
+	if body["state"] != "pending_unbound" {
+		t.Fatalf("unbound pending misreported: %v", body)
+	}
 }

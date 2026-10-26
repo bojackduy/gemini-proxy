@@ -375,6 +375,7 @@ func (h *handler) routes() http.Handler {
 	})
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
 	mux.HandleFunc("/v1/sessions/abandon", h.abandonSessions)
+	mux.HandleFunc("/v1/sessions/state", h.sessionState)
 	return mux
 }
 
