@@ -702,65 +702,47 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.writeChatResponse(w, &req, resp, "")
 		return
 	}
-	// Per-session pending guard. An uncertain submission refuses ITS OWN
-	// requests only: every other identity keeps working, which is the property
-	// the global readiness gate used to stand in for. This is a real refusal —
-	// no submission, no browser action, no state change for this session.
-	//
-	// The dirty path below still owns every record recovery can act on (exact
-	// adoption, hash-lineage auto-resync, rewrite reseed — all fail-closed).
-	// A record carrying none of the recovery preconditions, e.g. pending=true
-	// with an empty pending prompt written before the recovery stack existed,
-	// could never be adopted or reseeded, so it is refused here instead of
-	// buying a 90s browser read that cannot succeed. Clearing such a record is
-	// an explicit operator action: POST /v1/sessions/abandon.
-	if sess.Pending && sess.PendingPrompt == "" {
-		diag := h.sentDiagnosis(sid, sess)
-		h.mu.Unlock()
-		h.writeError(w, http.StatusServiceUnavailable, "pending_turn",
-			"pending uncertain turn; inspect owned chat; "+diag+"; no code path can resolve this record (no stored prompt); clear it explicitly via POST /v1/sessions/abandon")
-		return
-	}
 	var reseedPlan *rewritePlan
 	if sess.Pending {
-		// Dirty path: read-only recovery first (exact adoption, then
-		// hash-lineage auto-resync), then dirty rewrite-reseed. Success
-		// records the completed turn and falls through to
-		// duplicate-cache/delta below; a reseed plan abandons the
-		// uncertain thread and continues as a fresh reseed seed;
-		// otherwise 409 + diagnosis with Dirty untouched.
-		h.mu.Unlock()
-		if h.recoverPending(r, sid) {
-			h.mu.Lock()
-			sess = h.sessions[sid]
-			if sess == nil {
-				h.mu.Unlock()
-				h.writeError(w, http.StatusInternalServerError, "server_error", "recovery lost the session journal")
-				return
-			}
-		} else {
-			h.mu.Lock()
-			s2 := h.sessions[sid]
-			h.mu.Unlock()
-			if plan := h.planDirtyReseed(sid, s2, req.Messages); plan != nil {
-				log.Printf("[openai] session=%s rewrite-reseed armed classification=%s carried=%d not_carried=%d; abandoning uncertain thread without adoption",
-					shortSID(sid), plan.classification, len(plan.carriedIDs), len(plan.notCarried))
-				reseedPlan = plan
-				h.mu.Lock()
-				sess = h.sessions[sid]
-				if sess == nil {
-					h.mu.Unlock()
-					h.writeError(w, http.StatusInternalServerError, "server_error", "recovery lost the session journal")
-					return
+		// A record with no binding at all cannot prove what was submitted, so
+		// it is refused fast and names the operator exit.
+		unbound := len(sess.PendingMessages) == 0 && sess.PendingPrompt == ""
+		// Model/schema changes alone do not establish new input. Keep exact
+		// uncertain retries fenced without invoking implicit browser recovery.
+		same := len(sess.PendingMessages) == 0 || len(req.Messages) == len(sess.PendingMessages)
+		if len(sess.PendingMessages) != 0 && same {
+			for i := range req.Messages {
+				if !canonicalEqual(req.Messages[i], sess.PendingMessages[i]) {
+					same = false
+					break
 				}
-			} else {
-				h.mu.Lock()
-				diag := h.sentDiagnosis(sid, h.sessions[sid])
-				h.mu.Unlock()
-				h.writeError(w, http.StatusConflict, "pending_turn", "previous submission is uncertain; inspect the owned Gemini chat, then use a new session ID; no automatic resubmission; "+diag)
-				return
 			}
 		}
+		if same || !coherentTranscript(req.Messages) {
+			msg := "previous submission is uncertain; use explicit recovery to read it back, or send a distinct request; no automatic resubmission"
+			if unbound {
+				msg = "pending uncertain turn; inspect owned chat, or clear an unresolvable record explicitly via POST /v1/sessions/abandon; no automatic resubmission"
+			}
+			// The refusal keeps the sent-log lineage line: without it the
+			// operator cannot tell a lost submission from an overwritten
+			// pending prompt before choosing recovery or abandon.
+			h.mu.Unlock()
+			h.writeError(w, http.StatusUnprocessableEntity, "pending_turn", msg+"; "+h.sentDiagnosis(sid, sess))
+			return
+		}
+		// Context continuity is best effort: the client's history is
+		// authoritative. Record what is abandoned (executed exchanges are
+		// carried inertly; the undelivered turn is listed, never resent), but
+		// never read the old chat back and never let an unverifiable old
+		// answer gate the new request. Work on a copy until prompt validation
+		// succeeds.
+		reseedPlan = h.planDirtyReseed(sid, sess, req.Messages)
+		next := *sess
+		next.URL, next.Messages = "", nil
+		next.LastReqHash, next.LastRespID = "", ""
+		clearPendingBinding(&next)
+		sess = &next
+		log.Printf("[openai] continuation reason=uncertain_branch incoming_messages=%d planned=%v", len(req.Messages), reseedPlan != nil)
 	}
 	// Delta vs fresh: incoming history extending the stored prefix sends
 	// only the suffix; anything else starts a new chat and replays the
@@ -842,6 +824,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	sess.PendingTools = req.Tools
 	sess.PendingChoice = req.ToolChoice
 	sess.PendingReqHash = hash
+	h.sessions[sid] = sess
 	h.saveLocked()
 	h.mu.Unlock()
 

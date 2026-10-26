@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,8 +17,62 @@ import (
 	"github.com/bojackduy/gemini-proxy/internal/gemini"
 )
 
+// TestMain silences the adapter's content-free logging so a failing assertion
+// is the first thing a truncated check log shows.
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard)
+	os.Exit(m.Run())
+}
+
 // fakeBackend answers Ask without a browser.
 type fakeBackend struct{}
+
+func TestBestEffortPendingContinuationWithoutReadback(t *testing.T) {
+	for _, hasHistory := range []bool{false, true} {
+		name := "empty_committed_history"
+		if hasHistory {
+			name = "committed_history"
+		}
+		t.Run(name, func(t *testing.T) {
+			reads := 0
+			fake := &fakeRecoveryBackend{askAnswer: "fresh answer", urlNow: "https://gemini.google.com/app/NEW"}
+			fake.readTurn = func(string, string) (gemini.TurnResult, error) { reads++; return gemini.TurnResult{}, structuralMismatch() }
+			fake.readLatest = func(string) (string, gemini.TurnResult, error) { reads++; return "", gemini.TurnResult{}, errors.New("unavailable") }
+			pending := []message{{Role: "user", Content: "uncertain request"}}
+			stored := []message(nil)
+			if hasHistory {
+				stored = []message{{Role: "user", Content: "old question"}, {Role: "assistant", Content: "old answer"}}
+				pending = append(append([]message(nil), stored...), pending...)
+			}
+			h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+				sessions: map[string]*session{"s": {Messages: stored, Pending: true, PendingPrompt: "pending prompt", PendingMessages: pending, URL: "https://gemini.google.com/app/OLD"}}}
+			h.gate <- struct{}{}
+			incoming := append(append([]message(nil), pending...), message{Role: "user", Content: "continue with this new request"})
+			w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: incoming})
+			if reads != 0 || w.Code != http.StatusOK || fake.asks != 1 || !fake.gotFresh {
+				t.Fatalf("new input blocked or read back: reads=%d status=%d asks=%d fresh=%v", reads, w.Code, fake.asks, fake.gotFresh)
+			}
+			if !strings.Contains(fake.gotPrompt, "continue with this new request") {
+				t.Fatal("new message missing from fresh seed")
+			}
+		})
+	}
+}
+
+func TestBestEffortIdenticalPendingRetryNeverSubmits(t *testing.T) {
+	reads := 0
+	fake := &fakeRecoveryBackend{askAnswer: "must not send"}
+	fake.readTurn = func(string, string) (gemini.TurnResult, error) { reads++; return gemini.TurnResult{}, structuralMismatch() }
+	fake.readLatest = func(string) (string, gemini.TurnResult, error) { reads++; return "", gemini.TurnResult{}, errors.New("unavailable") }
+	pending := []message{{Role: "user", Content: "uncertain request"}}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		sessions: map[string]*session{"s": {Pending: true, PendingPrompt: "pending prompt", PendingMessages: pending, URL: "https://gemini.google.com/app/OLD"}}}
+	h.gate <- struct{}{}
+	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: pending})
+	if w.Code == http.StatusOK || fake.asks != 0 || reads != 0 {
+		t.Fatalf("uncertain retry sent or implicitly recovered: status=%d asks=%d reads=%d", w.Code, fake.asks, reads)
+	}
+}
 
 func TestReadyBusyAndPendingAreNotAuthFailures(t *testing.T) {
 	newHandler := func(client browserClient, sessions map[string]*session) *handler {
@@ -198,8 +254,8 @@ func TestPendingTurnNeverCallsBrowser(t *testing.T) {
 	h := &handler{model: "gemini-web", client: fake, sessions: map[string]*session{"s": {Pending: true}}, gate: make(chan struct{}, 1)}
 	h.gate <- struct{}{}
 	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "hello"}}})
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("pending must fail closed: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("pending must fail closed non-retryably: %d %s", w.Code, w.Body.String())
 	}
 	if !strings.Contains(w.Body.String(), "pending uncertain turn; inspect owned chat") {
 		t.Fatalf("refusal must name the state: %s", w.Body.String())
@@ -444,7 +500,7 @@ func TestSentDiagnosisLines(t *testing.T) {
 	}
 }
 
-func TestPending409CarriesDiagnosis(t *testing.T) {
+func TestPendingRefusalCarriesDiagnosis(t *testing.T) {
 	h := &handler{model: "gemini-web",
 		sessions: map[string]*session{"s": {Pending: true, PendingPrompt: "newer retry", URL: "https://gemini.google.com/app/abc"}},
 		gate:     make(chan struct{}, 1)}
@@ -454,11 +510,11 @@ func TestPending409CarriesDiagnosis(t *testing.T) {
 	r.Header.Set("X-Session-Id", "s")
 	w := httptest.NewRecorder()
 	h.routes().ServeHTTP(w, r)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("pending must fail closed: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("pending must fail closed non-retryably: %d %s", w.Code, w.Body.String())
 	}
 	if !strings.Contains(w.Body.String(), "sent-log: MISMATCH") {
-		t.Fatalf("every 409 must carry the sent-log diagnosis line: %s", w.Body.String())
+		t.Fatalf("every pending refusal must carry the sent-log diagnosis line: %s", w.Body.String())
 	}
 }
 
@@ -512,6 +568,8 @@ func TestOversizeTurnNeverSubmitsOrLogs(t *testing.T) {
 // recovery records answers, never submits or executes.
 type fakeRecoveryBackend struct {
 	asks       int
+	reads      int
+	latests    int
 	readTurn   func(url, prompt string) (gemini.TurnResult, error)
 	readLatest func(url string) (string, gemini.TurnResult, error)
 	// Ask double: records the submission for reseed/happy-path tests.
@@ -539,10 +597,12 @@ func (f *fakeRecoveryBackend) LoginState(_ context.Context) (*gemini.Status, err
 }
 
 func (f *fakeRecoveryBackend) ReadThreadTurn(_ context.Context, url, prompt string) (gemini.TurnResult, error) {
+	f.reads++
 	return f.readTurn(url, prompt)
 }
 
 func (f *fakeRecoveryBackend) ReadLatestThreadTurn(_ context.Context, url string) (string, gemini.TurnResult, error) {
+	f.latests++
 	return f.readLatest(url)
 }
 
@@ -709,13 +769,14 @@ func TestAutoResyncRefusesWithoutLineage(t *testing.T) {
 	if !s.Pending || s.AutoResyncEvidence != "" {
 		t.Fatalf("refusal must leave Dirty untouched and record no evidence: %+v", s)
 	}
-	// End to end the session still 409s with the diagnosis line.
-	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gemini-web","messages":[{"role":"user","content":"hi"}]}`))
+	// End to end the identical retry still refuses with the diagnosis line:
+	// a session whose recovery refused must never resubmit that turn.
+	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gemini-web","messages":[{"role":"user","content":"newer"}]}`))
 	r.Header.Set("X-Session-Id", "s")
 	w := httptest.NewRecorder()
 	h.routes().ServeHTTP(w, r)
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "sent-log:") {
-		t.Fatalf("ambiguous must keep 409 + diagnosis: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "sent-log:") {
+		t.Fatalf("identical retry after refused recovery must stay refused with diagnosis: %d %s", w.Code, w.Body.String())
 	}
 	if fake.asks != 0 {
 		t.Fatal("refused recovery must not submit")
@@ -907,9 +968,9 @@ func TestDirtyReseedAbandonsUnknown(t *testing.T) {
 	}
 }
 
-func TestLoadBearingUnknownRefusesReseed(t *testing.T) {
+func TestLoadBearingUnknownContinuesFresh(t *testing.T) {
 	fake := &fakeRecoveryBackend{
-		askAnswer: "must never submit", urlNow: "https://gemini.google.com/app/NEW",
+		askAnswer: "fresh answer", urlNow: "https://gemini.google.com/app/NEW",
 		readTurn: func(url, prompt string) (gemini.TurnResult, error) {
 			return gemini.TurnResult{}, errors.New("stored thread answer is not a finished rendering; inspect before recovery")
 		},
@@ -924,19 +985,33 @@ func TestLoadBearingUnknownRefusesReseed(t *testing.T) {
 				PendingMessages: []message{{Role: "user", Content: "q0"}, {Role: "user", Content: "q-pending"}}},
 		}, gate: make(chan struct{}, 1)}
 	h.gate <- struct{}{}
-	// The sent-log proves a COMPLETED answer for the pending prompt exists
-	// on the old thread: abandoning it would lose work — fail closed.
+	// The sent-log proves a COMPLETED answer for the pending prompt exists on
+	// the old thread. Continuity is still best effort: that answer is never
+	// adopted or read back, and the distinct request must proceed fresh.
 	h.appendSent(sentEntry{Event: "completed", Session: "s", URL: "https://gemini.google.com/app/OLD",
 		PromptHash: promptHash("PENDING PROMPT"), Bytes: 14, Chunk: 1, Chunks: 1, AnswerHash: "abc"})
 	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "q0"}, {Role: "user", Content: "q-new"}}})
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "sent-log:") {
-		t.Fatalf("load-bearing unknown must fail closed to 409 + diagnosis: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "fresh answer") {
+		t.Fatalf("distinct request must continue fresh: %d %s", w.Code, w.Body.String())
 	}
-	if !h.sessions["s"].Pending || h.sessions["s"].ReseedEvidence != "" {
-		t.Fatal("refusal must leave Dirty untouched and record nothing")
+	if !fake.gotFresh {
+		t.Fatal("abandoned chat must never be reused")
 	}
-	if fake.asks != 0 {
-		t.Fatal("unknown-state turns are never submitted")
+	if fake.reads != 0 || fake.latests != 0 {
+		t.Fatalf("continuation performed a readback: exact=%d latest=%d", fake.reads, fake.latests)
+	}
+	if fake.asks != 1 {
+		t.Fatalf("expected one fresh submission, got %d", fake.asks)
+	}
+	s := h.sessions["s"]
+	if s.Pending || s.PendingPrompt != "" {
+		t.Fatal("continuation must clear the abandoned uncertainty")
+	}
+	if !strings.Contains(s.ReseedEvidence, "pending:") || !strings.Contains(s.ReseedEvidence, "never submitted as pending") {
+		t.Fatalf("unknown turn must be listed as not-carried: %q", s.ReseedEvidence)
+	}
+	if s.ReseedFrom != "https://gemini.google.com/app/OLD" {
+		t.Fatalf("linkage lost: %q", s.ReseedFrom)
 	}
 }
 

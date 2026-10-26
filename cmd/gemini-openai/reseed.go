@@ -18,7 +18,7 @@ import (
 // the journal).
 //
 // Order on the Dirty branch: adoption → auto-resync → dirty-reseed plan →
-// 409 + diagnosis (genuinely ambiguous only). On the clean branch a
+// 422 + diagnosis (genuinely ambiguous only). On the clean branch a
 // coherent rewrite reseeds; incoherent input keeps the legacy full-history
 // fresh replay (clean sessions hold no uncertainty to protect).
 // The old thread is abandoned truthfully — no adoption comparison against
@@ -29,10 +29,11 @@ import (
 // Rewrite classifications. "ambiguous" is not a rewrite: the incoming
 // history is internally incoherent, so no reseed is attempted.
 const (
-	rewriteTruncation = "rewrite-truncation" // revert/truncation: shorter, prefix-equal
-	rewriteDivergence = "rewrite-divergence" // fork/regeneration: same-length-but-diverged content
-	rewriteCompaction = "rewrite-compaction" // compaction: summarized system prefix
-	rewriteAmbiguous  = "ambiguous"          // incoherent: dangling/duplicate/unmatched tool results
+	rewriteTruncation   = "rewrite-truncation"   // revert/truncation: shorter, prefix-equal
+	rewriteDivergence   = "rewrite-divergence"   // fork/regeneration: same-length-but-diverged content
+	rewriteCompaction   = "rewrite-compaction"   // compaction: summarized system prefix
+	rewriteContinuation = "rewrite-continuation" // client moved past the uncertain turn: committed journal is a canonical prefix of incoming
+	rewriteAmbiguous    = "ambiguous"            // incoherent: dangling/duplicate/unmatched tool results
 )
 
 // prefixMismatch contains structure only: which saved-journal index and
@@ -261,26 +262,6 @@ func carryExecuted(s *session, pending []message, incoming []message) (carried [
 	return carried, carriedIDs, incomplete
 }
 
-// sentCompletedFor reports whether the sent-log records a completed
-// submission of the given prompt hash to the given thread by this session.
-// A completed-but-unbound answer is load-bearing: the old thread holds a
-// real answer that neither adoption nor auto-resync could bind, so
-// abandoning it silently would lose work — fail closed to 409, never guess.
-func (h *handler) sentCompletedFor(session, url, promptHash string) bool {
-	for i := len(h.sentLog) - 1; i >= 0; i-- {
-		e := h.sentLog[i]
-		if e.Session == session && e.URL == url && e.Event == "completed" && e.PromptHash == promptHash {
-			return true
-		}
-	}
-	for _, e := range h.sentLogTail(300) {
-		if e.Session == session && e.URL == url && e.Event == "completed" && e.PromptHash == promptHash {
-			return true
-		}
-	}
-	return false
-}
-
 // planCleanReseed validates a rewrite reseed for a non-dirty session: the
 // incoming history is a coherent rewrite of committed state, so reseeding
 // fresh with carried executed results is safe. It returns nil for
@@ -306,31 +287,42 @@ func planCleanReseed(s *session, incoming []message) *rewritePlan {
 	}
 }
 
-// planDirtyReseed validates a rewrite reseed for a dirty session, after
-// adoption and auto-resync have already refused the interrupt shape.
-// Unknown-state items (the still-pending turn) are listed as NOT carried
-// and the old thread is abandoned without delivery — safe because an
-// undelivered answer caused no external execution. It returns nil (caller
-// keeps 409 with sent-log diagnosis) when the shape is not a coherent
-// rewrite, when the pending binding is too incomplete to reason about, or
-// when the unknown item is load-bearing: a verifiable completed answer
-// for the pending prompt exists on the old thread.
+// planDirtyReseed records the abandonment of an uncertain remote chat for a
+// pending session. Unknown-state items (the still-pending turn) are listed as
+// NOT carried and the old chat is abandoned without delivery — safe because an
+// undelivered answer caused no external execution. Context continuity is best
+// effort, so this plan never gates the request: it returns nil when the shape
+// cannot be classified (retry of the same uncertain request, or a missing
+// journal) and the caller still proceeds from the client's own history.
 func (h *handler) planDirtyReseed(id string, s *session, incoming []message) *rewritePlan {
-	if s == nil || s.URL == "" {
+	if s == nil || !s.Pending {
 		return nil
 	}
-	if !s.Pending || s.PendingPrompt == "" || len(s.PendingMessages) == 0 {
-		return nil
+	var kind string
+	var mm *prefixMismatch
+	if len(s.Messages) == 0 {
+		// No committed journal to rewrite: every incoming message is client
+		// history, so the fresh chat is a continuation, not a rewrite.
+		kind = rewriteContinuation
+		mm = &prefixMismatch{Index: 0, Field: "history.none"}
+	} else {
+		kind, mm = classifyHistoryRewrite(incoming, s.Messages)
 	}
-	kind, mm := classifyHistoryRewrite(incoming, s.Messages)
-	if kind == "" || kind == rewriteAmbiguous {
+	if kind == "" {
+		// The committed journal is a canonical prefix of the incoming
+		// history: the client moved past the uncertain turn (revert, fork or
+		// model switch). Abandon the old chat without delivery and seed fresh
+		// from the client's own timeline.
+		if len(incoming) <= len(s.Messages) {
+			return nil
+		}
+		log.Printf("[openai] session=%s rewrite-reseed continuation: committed journal is a prefix of the client history added=%d; uncertain turn abandoned without resubmission", id, len(incoming)-len(s.Messages))
+		kind = rewriteContinuation
+		mm = &prefixMismatch{Index: len(s.Messages), Field: "history.extension"}
+	} else if kind == rewriteAmbiguous {
 		if mm != nil {
 			log.Printf("[openai] session=%s rewrite-reseed refused: not a coherent rewrite (append or ambiguous); keeping uncertainty", id)
 		}
-		return nil
-	}
-	if s.PendingPrompt != "" && h.sentCompletedFor(id, s.URL, promptHash(s.PendingPrompt)) {
-		log.Printf("[openai] session=%s rewrite-reseed refused: sent-log holds a completed answer for the pending prompt on thread %s that recovery could not bind (load-bearing); keeping uncertainty", id, s.URL)
 		return nil
 	}
 	carried, carriedIDs, incomplete := carryExecuted(s, s.PendingMessages, incoming)
