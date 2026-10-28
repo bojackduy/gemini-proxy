@@ -1443,9 +1443,10 @@ func TestSessionStateInspector(t *testing.T) {
 	}
 }
 
-func chunkedHandler(fake *fakeRecoveryBackend) *handler {
+func chunkedHandler(fake *fakeRecoveryBackend, t *testing.T) *handler {
 	h := &handler{model: "gemini-web", client: fake, maxChars: 3000, gate: make(chan struct{}, 1),
-		sessions: map[string]*session{}}
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions:  map[string]*session{}}
 	h.gate <- struct{}{}
 	return h
 }
@@ -1460,7 +1461,7 @@ func ackAnswerFor(prompt string) string {
 func TestChunkedReplaySplitsHistoryAndKeepsOneFinal(t *testing.T) {
 	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
 	fake.answerFor = ackAnswerFor
-	h := chunkedHandler(fake)
+	h := chunkedHandler(fake, t)
 	msgs := []message{
 		{Role: "user", Content: "Q1 " + strings.Repeat("a", 1200)},
 		{Role: "assistant", Content: "A1 " + strings.Repeat("b", 1200)},
@@ -1500,7 +1501,7 @@ func TestChunkedReplayRejectsNonAckImport(t *testing.T) {
 		}
 		return "all good"
 	}
-	h := chunkedHandler(fake)
+	h := chunkedHandler(fake, t)
 	msgs := []message{
 		{Role: "user", Content: "Q1 " + strings.Repeat("a", 1200)},
 		{Role: "assistant", Content: "A1 " + strings.Repeat("b", 1200)},
@@ -1523,7 +1524,7 @@ func TestChunkedReplayAcceptsEmptyImport(t *testing.T) {
 		}
 		return "all good"
 	}
-	h := chunkedHandler(fake)
+	h := chunkedHandler(fake, t)
 	msgs := []message{
 		{Role: "user", Content: "Q1 " + strings.Repeat("a", 1200)},
 		{Role: "assistant", Content: "A1 " + strings.Repeat("b", 1200)},
@@ -1538,7 +1539,7 @@ func TestChunkedReplayAcceptsEmptyImport(t *testing.T) {
 func TestSingleOversizeQuestionRefusedNotSplit(t *testing.T) {
 	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
 	fake.answerFor = ackAnswerFor
-	h := chunkedHandler(fake)
+	h := chunkedHandler(fake, t)
 	msgs := []message{{Role: "user", Content: strings.Repeat("q", 5000)}}
 	w := postJSON(t, h, "chunk4", chatRequest{Model: "gemini-web", Messages: msgs})
 	if w.Code != http.StatusRequestEntityTooLarge {
@@ -1565,7 +1566,8 @@ func TestSecondTurnSkipsOwnAnswerImport(t *testing.T) {
 		return "answer text"
 	}
 	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
-		sessions: map[string]*session{}}
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions:  map[string]*session{}}
 	h.gate <- struct{}{}
 	first := []message{{Role: "user", Content: "first question"}}
 	if w := postJSON(t, h, "steady", chatRequest{Model: "gemini-web", Messages: first}); w.Code != http.StatusOK {
@@ -1601,7 +1603,8 @@ func TestThreadRejoinAfterSlotLoss(t *testing.T) {
 		// an adapter restart. Delta must still engage when the tab never
 		// moved, proven read-only against the stored thread URL.
 		h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
-			sessions: map[string]*session{"rj": {Messages: []message{{Role: "user", Content: "q0"}}, URL: threadURL}}}
+			statePath: filepath.Join(t.TempDir(), "state.json"),
+			sessions:  map[string]*session{"rj": {Messages: []message{{Role: "user", Content: "q0"}}, URL: threadURL}}}
 		h.gate <- struct{}{}
 		return fake, h
 	}
