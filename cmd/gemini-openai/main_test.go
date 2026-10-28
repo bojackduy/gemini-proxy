@@ -947,8 +947,8 @@ func TestCleanReseedCarriesExecutedTools(t *testing.T) {
 		t.Fatalf("carried calls must render inert, never as pending: %q", fake.prompts)
 	}
 	s := h.sessions["s"]
-	if len(s.Messages) != len(incoming) {
-		t.Fatalf("journal must hold the rewritten timeline, not the carried record: %+v", s.Messages)
+	if len(s.Messages) != len(incoming)+1 {
+		t.Fatalf("journal must hold the rewritten timeline plus our answer, not the carried record: %+v", s.Messages)
 	}
 	if s.ReseedFrom != "https://gemini.google.com/app/OLD" || s.URL != "https://gemini.google.com/app/NEW" {
 		t.Fatalf("journal must link old→new thread: from=%q url=%q", s.ReseedFrom, s.URL)
@@ -1078,7 +1078,7 @@ func TestHappyPathAppendUnchanged(t *testing.T) {
 	if fake.gotFresh || strings.Contains(fake.gotPrompt, "PRIOR EXECUTION RECORD") {
 		t.Fatalf("append continuation must never reseed: fresh=%v prompt=%q", fake.gotFresh, fake.gotPrompt)
 	}
-	if s := h.sessions["s"]; s.ReseedEvidence != "" || len(s.Messages) != 2 {
+	if s := h.sessions["s"]; s.ReseedEvidence != "" || len(s.Messages) != 3 {
 		t.Fatalf("happy path must not journal reseed state: %+v", s)
 	}
 }
@@ -1145,7 +1145,7 @@ func TestReseedEvidenceSurvivesRestart(t *testing.T) {
 	}
 	s := restarted.sessions["s"]
 	if s == nil || s.Pending || s.ReseedFrom != "https://gemini.google.com/app/OLD" ||
-		!strings.Contains(s.ReseedEvidence, "rewrite-divergence") || len(s.Messages) != len(incoming) {
+		!strings.Contains(s.ReseedEvidence, "rewrite-divergence") || len(s.Messages) != len(incoming)+1 {
 		t.Fatalf("reseed linkage must survive restart: %+v", s)
 	}
 }
@@ -1487,8 +1487,8 @@ func TestChunkedReplaySplitsHistoryAndKeepsOneFinal(t *testing.T) {
 		t.Fatal("final turn must carry the question")
 	}
 	sess := h.sessions["chunk1"]
-	if sess == nil || len(sess.Messages) != len(msgs) || sess.URL == "" {
-		t.Fatalf("transcript not committed: %+v", sess)
+	if sess == nil || len(sess.Messages) != len(msgs)+1 || sess.URL == "" {
+		t.Fatalf("transcript plus our answer not committed: %+v", sess)
 	}
 }
 
@@ -1549,5 +1549,40 @@ func TestSingleOversizeQuestionRefusedNotSplit(t *testing.T) {
 	}
 	if fake.asks != 0 {
 		t.Fatalf("refused question must never reach the browser: %d asks", fake.asks)
+	}
+}
+
+func TestSecondTurnSkipsOwnAnswerImport(t *testing.T) {
+	// Live symptom: every other prompt replayed a ~1KB import because the
+	// journal never absorbed our own answers, so the client echo of the
+	// previous answer always looked like new history. Two consecutive
+	// turns: the second must send only its question.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "answer text"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		sessions: map[string]*session{}}
+	h.gate <- struct{}{}
+	first := []message{{Role: "user", Content: "first question"}}
+	if w := postJSON(t, h, "steady", chatRequest{Model: "gemini-web", Messages: first}); w.Code != http.StatusOK {
+		t.Fatalf("first turn: %d %s", w.Code, w.Body.String())
+	}
+	if n := len(h.sessions["steady"].Messages); n != 2 {
+		t.Fatalf("journal must absorb our answer: %d messages", n)
+	}
+	second := append(append([]message{}, h.sessions["steady"].Messages...), message{Role: "user", Content: "second question"})
+	fake.prompts, fake.freshFlags, fake.asks = nil, nil, 0
+	if w := postJSON(t, h, "steady", chatRequest{Model: "gemini-web", Messages: second}); w.Code != http.StatusOK {
+		t.Fatalf("second turn: %d %s", w.Code, w.Body.String())
+	}
+	if fake.asks != 1 {
+		t.Fatalf("second turn must send only its question, got %d submissions: %q", fake.asks, fake.prompts)
+	}
+	if strings.Contains(fake.prompts[0], "HISTORY IMPORT") {
+		t.Fatalf("no import on a clean continuation: %q", fake.prompts[0])
 	}
 }

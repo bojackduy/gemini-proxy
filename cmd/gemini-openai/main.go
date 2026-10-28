@@ -968,7 +968,10 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
-	sess.Messages = canonical
+	// Absorb our own answer into the prefix baseline (same shape as the
+	// read-back path): otherwise every next turn re-imports the previous
+	// answer as history on the thread that already holds it.
+	sess.Messages = append(canonical, message{Role: "assistant", Content: assistantContent(answer, images), ToolCalls: h.rebuildToolCalls(calls, toolIDs)})
 	sess.LastAnswer = answer
 	sess.LastImages = images
 	sess.LastReqHash = hash
