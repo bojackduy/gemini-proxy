@@ -62,10 +62,10 @@ func TestBestEffortPendingContinuationWithoutReadback(t *testing.T) {
 			h.gate <- struct{}{}
 			incoming := append(append([]message(nil), pending...), message{Role: "user", Content: "continue with this new request"})
 			w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: incoming})
-			// Uncertain request plus new request arrive as two user turns:
-			// import plus final in both subtests.
-			if reads != 0 || w.Code != http.StatusOK || fake.asks != 2 || len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
-				t.Fatalf("new input blocked or read back: reads=%d status=%d asks=%d fresh=%v", reads, w.Code, fake.asks, fake.freshFlags)
+			// One bounded adopt attempt (structural refusal), then reseed
+			// fallback: reads happen, resubmission never does.
+			if reads != 1 || w.Code != http.StatusOK || fake.asks != 2 || len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+				t.Fatalf("new input blocked: reads=%d status=%d asks=%d fresh=%v", reads, w.Code, fake.asks, fake.freshFlags)
 			}
 			if !strings.Contains(fake.gotPrompt, "continue with this new request") {
 				t.Fatal("new message missing from fresh seed")
@@ -1093,8 +1093,8 @@ func TestLoadBearingUnknownContinuesFresh(t *testing.T) {
 		}, gate: make(chan struct{}, 1)}
 	h.gate <- struct{}{}
 	// The sent-log proves a COMPLETED answer for the pending prompt exists on
-	// the old thread. Continuity is still best effort: that answer is never
-	// adopted or read back, and the distinct request must proceed fresh.
+	// the old thread, but the read returns no finished rendering: one
+	// bounded adopt attempt, then best-effort fresh continuation as before.
 	h.appendSent(sentEntry{Event: "completed", Session: "s", URL: "https://gemini.google.com/app/OLD",
 		PromptHash: promptHash("PENDING PROMPT"), Bytes: 14, Chunk: 1, Chunks: 1, AnswerHash: "abc"})
 	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "q0"}, {Role: "user", Content: "q-new"}}})
@@ -1104,8 +1104,8 @@ func TestLoadBearingUnknownContinuesFresh(t *testing.T) {
 	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
 		t.Fatal("abandoned chat must never be reused")
 	}
-	if fake.reads != 0 || fake.latests != 0 {
-		t.Fatalf("continuation performed a readback: exact=%d latest=%d", fake.reads, fake.latests)
+	if fake.reads < 1 || fake.latests != 0 {
+		t.Fatalf("one bounded adopt attempt, no auto-resync: exact=%d latest=%d", fake.reads, fake.latests)
 	}
 	if fake.asks != 2 {
 		t.Fatalf("expected import plus final submission, got %d", fake.asks)
@@ -2189,5 +2189,51 @@ func TestSystemPlusUserDivergenceReseeds(t *testing.T) {
 	}
 	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
 		t.Fatalf("non-system divergence must start a new chat: fresh=%v", fake.freshFlags)
+	}
+}
+
+func TestDirtyAdoptsCompletedTurnAndStaysOnThread(t *testing.T) {
+	// Interrupted turn whose answer completed: one bounded adopt commits
+	// it and the new request continues delta on the SAME thread — no
+	// replay, no new chat. Nothing is resubmitted either way.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/OLD"}
+	fake.readTurn = func(url, prompt string) (gemini.TurnResult, error) {
+		return gemini.TurnResult{Answer: "adopted answer"}, nil
+	}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "followup answer"
+	}
+	pending := []message{{Role: "user", Content: "q0"}, {Role: "user", Content: "q-pending"}}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions: map[string]*session{"s": {Messages: []message{{Role: "user", Content: "q0"}},
+			Pending: true, PendingPrompt: "q-pending", PendingMessages: pending,
+			URL: "https://gemini.google.com/app/OLD"}}}
+	h.gate <- struct{}{}
+	incoming := append(append([]message{}, pending...),
+		message{Role: "assistant", Content: "adopted answer"},
+		message{Role: "user", Content: "followup"})
+	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "followup answer") {
+		t.Fatalf("adopted continuation: %d %s", w.Code, w.Body.String())
+	}
+	if fake.reads != 1 {
+		t.Fatalf("exactly one bounded adopt attempt: %d", fake.reads)
+	}
+	if fake.asks != 1 || len(fake.freshFlags) != 1 || fake.freshFlags[0] {
+		t.Fatalf("one delta submit on the same thread: asks=%d fresh=%v", fake.asks, fake.freshFlags)
+	}
+	s := h.sessions["s"]
+	if s.Pending || s.URL != "https://gemini.google.com/app/OLD" {
+		t.Fatalf("adopted session must be clean on its thread: %+v", s)
+	}
+	if s.ReseedEvidence != "" || s.ReseedFrom != "" {
+		t.Fatalf("adoption must not reseed: %+v", s)
+	}
+	if n := len(s.Messages); n != len(incoming)+1 || s.Messages[n-1].Content != "followup answer" {
+		t.Fatalf("transcript must extend through the followup: %+v", s.Messages)
 	}
 }

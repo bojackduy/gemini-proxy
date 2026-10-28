@@ -803,19 +803,33 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, http.StatusUnprocessableEntity, "pending_turn", msg+"; "+h.sentDiagnosis(sid, sess))
 			return
 		}
-		// Context continuity is best effort: the client's history is
-		// authoritative. Record what is abandoned (executed exchanges are
-		// carried inertly; the undelivered turn is listed, never resent), but
-		// never read the old chat back and never let an unverifiable old
-		// answer gate the new request. Work on a copy until prompt validation
-		// succeeds.
-		reseedPlan = h.planDirtyReseed(sid, sess, req.Messages)
-		next := *sess
-		next.URL, next.Messages = "", nil
-		next.LastReqHash, next.LastRespID = "", ""
-		clearPendingBinding(&next)
-		sess = &next
-		log.Printf("[openai] continuation reason=uncertain_branch incoming_messages=%d planned=%v", len(req.Messages), reseedPlan != nil)
+		// Best-effort fast adoption first: an interrupted turn often completed
+		// (cancels routinely land after the answer exists). A bounded
+		// read-only adopt commits it and the request below continues delta
+		// on the same thread — no replay. Anything unadoptable falls
+		// through to the reseed path unchanged. Nothing is submitted and
+		// nothing executes here either way; the unlock brackets the browser
+		// wait (recordCompletedTurn takes the lock itself).
+		h.mu.Unlock()
+		adopted, _ := h.tryAdoptInterruptedWait(r, sid, sess, h.dirtyAdoptWait())
+		h.mu.Lock()
+		if adopted {
+			log.Printf("[openai] session=%s dirty-adopted interrupted turn; continuing without reseed", shortSID(sid))
+		} else {
+			// Context continuity is best effort: the client's history is
+			// authoritative. Record what is abandoned (executed exchanges are
+			// carried inertly; the undelivered turn is listed, never resent).
+			// The adopt attempt above already proved nothing readable exists,
+			// so no unverifiable answer gates the new request. Work on a copy
+			// until prompt validation succeeds.
+			reseedPlan = h.planDirtyReseed(sid, sess, req.Messages)
+			next := *sess
+			next.URL, next.Messages = "", nil
+			next.LastReqHash, next.LastRespID = "", ""
+			clearPendingBinding(&next)
+			sess = &next
+			log.Printf("[openai] continuation reason=uncertain_branch incoming_messages=%d planned=%v", len(req.Messages), reseedPlan != nil)
+		}
 	}
 	// Delta vs fresh: incoming history extending the stored prefix sends
 	// only the suffix; anything else starts a new chat and replays the
@@ -1240,6 +1254,16 @@ type geminiTurn struct {
 	// synced counts seeded-list messages completed through this turn, for
 	// partial journal advance on interruption. Record turns use 0.
 	synced int
+}
+
+// dirtyAdoptWait bounds the implicit adoption attempt on the dirty path:
+// an explicit test override wins, else 30s. Production explicit recovery
+// keeps its own (longer) budget via the legacy rule.
+func (h *handler) dirtyAdoptWait() time.Duration {
+	if h.adoptWait > 0 {
+		return h.adoptWait
+	}
+	return 30 * time.Second
 }
 
 // pasteLimit is the byte ceiling for ONE composer submission. -max-paste-bytes

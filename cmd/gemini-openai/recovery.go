@@ -64,8 +64,9 @@ func spansStructural(spans string) bool {
 // result on full normalized equality. A typed structural mismatch is
 // returned separately so the caller can attempt hash-lineage auto-resync;
 // every other failure returns adopted=false with a nil mismatch and the
-// caller keeps terminal uncertainty.
-func (h *handler) readPendingTurn(r *http.Request, id string, s *session) (gemini.TurnResult, *gemini.UserBubbleMismatchError, bool) {
+// caller keeps terminal uncertainty. wait>0 caps the polling budget;
+// wait<=0 keeps the legacy rule (h.adoptWait override else the 90s default).
+func (h *handler) readPendingTurn(r *http.Request, id string, s *session, wait time.Duration) (gemini.TurnResult, *gemini.UserBubbleMismatchError, bool) {
 	if s.PendingPrompt == "" || s.URL == "" {
 		return gemini.TurnResult{}, nil, false
 	}
@@ -83,7 +84,9 @@ func (h *handler) readPendingTurn(r *http.Request, id string, s *session) (gemin
 			strings.Contains(msg, "not on the stored thread")
 	}
 	deadline := time.Now().Add(90 * time.Second)
-	if h.adoptWait > 0 {
+	if wait > 0 {
+		deadline = time.Now().Add(wait)
+	} else if h.adoptWait > 0 {
 		deadline = time.Now().Add(h.adoptWait)
 	}
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
@@ -210,7 +213,14 @@ func mustMarshalArgs(args map[string]any) string {
 // failure it returns false (with the structural mismatch, if any) and the
 // caller keeps terminal uncertainty.
 func (h *handler) tryAdoptInterrupted(r *http.Request, id string, s *session) (bool, *gemini.UserBubbleMismatchError) {
-	res, mismatch, adopted := h.readPendingTurn(r, id, s)
+	return h.tryAdoptInterruptedWait(r, id, s, 0)
+}
+
+// tryAdoptInterruptedWait is tryAdoptInterrupted with an explicit polling
+// budget (wait<=0 keeps the legacy h.adoptWait/90s rule), so the dirty path
+// can attempt a fast adopt without mutating shared handler state.
+func (h *handler) tryAdoptInterruptedWait(r *http.Request, id string, s *session, wait time.Duration) (bool, *gemini.UserBubbleMismatchError) {
+	res, mismatch, adopted := h.readPendingTurn(r, id, s, wait)
 	if mismatch != nil || !adopted {
 		return false, mismatch
 	}
