@@ -160,13 +160,17 @@ func firstMismatch(incoming, saved []message) *prefixMismatch {
 	return nil
 }
 
-// prefixSkipped checks the saved journal is a prefix of the incoming
-// history, tolerating append-only client echo bloat: a saved message may
-// reappear with up to tol appended bytes (the client re-rendering our
-// answers with appended notes). Anything else — truncation, rewrites,
-// role/name/call changes — fails closed to the reseed path. Returns the
-// total skipped bytes for the log. Content-free: lengths only.
-func prefixSkipped(saved, incoming []message, tol int) (bool, int) {
+// echoBloatSkipped checks the saved journal against incoming with one
+// narrow exception to strict equality: an assistant-role message may
+// reappear with up to tol appended bytes. Live evidence shows the client
+// re-echoing our just-committed answers with appended re-render notes
+// (~637B, pure append at the full saved length); treating that as a
+// rewrite reseeds a new chat every turn. Tolerance applies ONLY to
+// assistant echoes of our own committed answers — roles, names, call IDs
+// and tool calls stay exact, truncation fails closed, and user/system/tool
+// divergences of any size stay significant (a user edit to old text must
+// never be silently dropped). Returns total skipped bytes for the log.
+func echoBloatSkipped(saved, incoming []message, tol int) (bool, int) {
 	if len(incoming) < len(saved) {
 		return false, 0
 	}
@@ -176,7 +180,10 @@ func prefixSkipped(saved, incoming []message, tol int) (bool, int) {
 			continue
 		}
 		a, b := saved[i], incoming[i]
-		if a.Role != b.Role || a.Name != b.Name || a.ToolCallID != b.ToolCallID {
+		if a.Role != "assistant" || b.Role != "assistant" {
+			return false, 0
+		}
+		if a.Name != b.Name || a.ToolCallID != b.ToolCallID {
 			return false, 0
 		}
 		if len(a.ToolCalls) != len(b.ToolCalls) {

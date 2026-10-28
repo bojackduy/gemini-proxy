@@ -195,11 +195,56 @@ type imageAsker interface {
 
 // askTurn submits one turn via the richest surface the client offers.
 func (h *handler) askTurn(ctx context.Context, prompt string, fresh bool) (string, []gemini.ResponseImage, error) {
-	if ia, ok := h.client.(imageAsker); ok {
-		return ia.AskWithImages(ctx, prompt, fresh, 10*time.Minute)
+	return h.askTurnOnThread(ctx, prompt, "", fresh)
+}
+
+// threadRichAsker is the thread-bound rich-submission surface:
+// *gemini.Client implements it. Handlers prefer it when available so every
+// continuation chunk is restored to and verified on the saved thread inside
+// the same tab lock that submits.
+type threadRichAsker interface {
+	AskWithImagesThread(ctx context.Context, prompt, threadURL string, newSession bool, timeout time.Duration) (string, []gemini.ResponseImage, error)
+}
+
+// threadPlainAsker is the thread-bound plain-submission surface.
+type threadPlainAsker interface {
+	AskThread(ctx context.Context, prompt, threadURL string, newSession bool, timeout time.Duration) (string, error)
+}
+
+// askTurnOnThread submits one turn bound to threadURL. Fresh turns ignore
+// the binding (the browser mints the thread); continuation turns require a
+// valid binding and a thread-aware client — otherwise it fails closed with
+// zero typing and zero sends, never falling back to an unbound submit.
+func (h *handler) askTurnOnThread(ctx context.Context, prompt, threadURL string, fresh bool) (string, []gemini.ResponseImage, error) {
+	if fresh {
+		// Fresh chats mint their thread. The rich surface wins when
+		// offered (it mints exactly like the thread-aware fresh path);
+		// otherwise the thread-aware surfaces mint so later chunks can
+		// bind the minted URL.
+		if ia, ok := h.client.(imageAsker); ok {
+			return ia.AskWithImages(ctx, prompt, true, 10*time.Minute)
+		}
+		if ia, ok := h.client.(threadRichAsker); ok {
+			return ia.AskWithImagesThread(ctx, prompt, "", true, 10*time.Minute)
+		}
+		if pa, ok := h.client.(threadPlainAsker); ok {
+			answer, err := pa.AskThread(ctx, prompt, "", true, 10*time.Minute)
+			return answer, nil, err
+		}
+		answer, err := h.client.Ask(ctx, prompt, true, 10*time.Minute)
+		return answer, nil, err
 	}
-	answer, err := h.client.Ask(ctx, prompt, fresh, 10*time.Minute)
-	return answer, nil, err
+	if !gemini.ValidThreadURL(threadURL) {
+		return "", nil, fmt.Errorf("thread binding missing-or-invalid-target: %w", gemini.ErrThreadBinding)
+	}
+	if ia, ok := h.client.(threadRichAsker); ok {
+		return ia.AskWithImagesThread(ctx, prompt, threadURL, false, 10*time.Minute)
+	}
+	if pa, ok := h.client.(threadPlainAsker); ok {
+		answer, err := pa.AskThread(ctx, prompt, threadURL, false, 10*time.Minute)
+		return answer, nil, err
+	}
+	return "", nil, fmt.Errorf("thread binding binding-unsupported: %w", gemini.ErrThreadBinding)
 }
 
 // assistantContent builds the assistant message payload: plain string for
@@ -766,37 +811,44 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var recordMsgs []message
 	var sysHead string
 	fresh := true
-	// Delta when the incoming history extends the stored prefix. The fast
-	// path needs the tab on this session's thread (single live tab): the
-	// in-memory slot proves it, or — after a restart wiped the slot — a
-	// read-only check that the tab never moved proves it. Anything else
-	// starts a new chat rather than appending to the wrong thread.
-	if reseedPlan == nil && len(sess.Messages) > 0 {
-		// Tolerant prefix: client echoes of our answers may carry appended
-		// re-render notes (bounded by prefixSkipped). Anything beyond that
-		// fails closed to the fresh/reseed path below.
-		match, skipped := prefixSkipped(sess.Messages, req.Messages, 1024)
-		if match {
-			if skipped > 0 {
+	// Delta when the incoming history extends the stored prefix EXACTLY,
+	// plus one narrow exception: assistant echo bloat. The client
+	// re-echoes our just-committed answers with appended re-render notes
+	// (live: ~637B pure appends); treating that as a rewrite reseeds a
+	// new chat every turn. echoBloatSkipped absorbs assistant-only appends
+	// up to 1024B — roles, names, call IDs and tool calls stay exact, and
+	// user/system/tool divergences of any size stay significant, so a
+	// genuine edit is never silently dropped. (Former broad tolerance for
+	// all roles is removed for exactly that reason.)
+	// Location proof is the per-transaction thread binding at submit time,
+	// not the in-memory slot: hasActive/activeSID never proves which
+	// conversation the tab shows, so it plays no role here. A prefix match
+	// with a valid saved URL attempts the delta; if the tab cannot be
+	// restored to that URL the submit fails closed — never a silent new
+	// chat.
+	if reseedPlan == nil && len(sess.Messages) > 0 && firstMismatch(req.Messages, sess.Messages) == nil {
+		if gemini.ValidThreadURL(sess.URL) {
+			fresh = false
+			if teach := h.teachReminder(req, sess); teach != "" {
+				sysHead = teach + "\n\n"
+			}
+			seedMsgs = req.Messages[len(sess.Messages):]
+		} else {
+			log.Printf("[openai] session=%s delta-refused reason=missing-or-invalid-target incoming_messages=%d saved_messages=%d",
+				shortSID(sid), len(req.Messages), len(sess.Messages))
+		}
+	} else if reseedPlan == nil && len(sess.Messages) > 0 {
+		if ok, skipped := echoBloatSkipped(sess.Messages, req.Messages, 1024); ok {
+			if gemini.ValidThreadURL(sess.URL) {
 				log.Printf("[openai] session=%s tolerant-prefix skipped=%dB echo-bloat absorbed", shortSID(sid), skipped)
-			}
-			if h.hasActive && h.activeSID == sid {
 				fresh = false
-			} else if sess.URL != "" && h.currentThreadURL(r.Context()) == sess.URL {
-				fresh = false
-				log.Printf("[openai] session=%s thread-rejoin tab still on stored thread; continuing delta", shortSID(sid))
-			}
-			if h.hasActive && h.activeSID == sid {
-				fresh = false
-			} else if sess.URL != "" && h.currentThreadURL(r.Context()) == sess.URL {
-				fresh = false
-				log.Printf("[openai] session=%s thread-rejoin tab still on stored thread; continuing delta", shortSID(sid))
-			}
-			if !fresh {
 				if teach := h.teachReminder(req, sess); teach != "" {
 					sysHead = teach + "\n\n"
 				}
 				seedMsgs = req.Messages[len(sess.Messages):]
+			} else {
+				log.Printf("[openai] session=%s delta-refused reason=missing-or-invalid-target incoming_messages=%d saved_messages=%d",
+					shortSID(sid), len(req.Messages), len(sess.Messages))
 			}
 		}
 	}
@@ -829,6 +881,20 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordMsgs = reseedPlan.carried
 		}
 		seedMsgs = req.Messages
+		// Every new thread is explicitly authorized: genuine fresh (no
+		// committed history) or a classified history rewrite. Anything
+		// else reaching here is the legacy incoherent-input replay.
+		{
+			reason := "legacy-replay"
+			switch {
+			case len(sess.Messages) == 0:
+				reason = "genuine-fresh"
+			case reseedPlan != nil:
+				reason = "reseed-" + reseedPlan.classification
+			}
+			log.Printf("[openai] session=%s new-thread-authorized reason=%s incoming_messages=%d saved_messages=%d",
+				shortSID(sid), reason, len(req.Messages), len(sess.Messages))
+		}
 	}
 	// Chunk into bounded turns: carried record first (inert ACK imports),
 	// then history imports plus one final answer-seeking turn. Single-turn
@@ -877,18 +943,12 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	h.saveLocked()
 	h.mu.Unlock()
 
-	// Best-effort read-only thread linkage for the sent-log. Empty when
-	// the browser is unreachable; the submission is still recorded.
-	preURL := h.currentThreadURL(r.Context())
-	h.mu.Lock()
-	if preURL != "" {
-		sess.URL = preURL
-	}
-	for i, t := range allTurns {
-		h.appendSent(sentEntry{Event: "submitted", Session: sid, URL: sess.URL, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(allTurns)})
-	}
-	h.saveLocked()
-	h.mu.Unlock()
+	// Per-chunk binding: the saved thread URL is the submit target for
+	// every continuation chunk. The journal URL is never overwritten here
+	// with a pre-submit probe (a rebuilt tab reports the homepage, which
+	// must not become the session's thread). Fresh turns mint their thread
+	// on chunk 1; later chunks bind to the minted URL captured below.
+	bound := sess.URL
 
 	started := time.Now()
 	fid := gemini.NewFlowID()
@@ -896,11 +956,35 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var images []gemini.ResponseImage
 	for i, t := range allTurns {
 		turnFresh := fresh && i == 0
+		kind := "final"
+		if t.replay {
+			kind = "replay"
+		}
+		if !turnFresh && !gemini.ValidThreadURL(bound) {
+			// Binding failed before anything was typed or sent: no new
+			// chat, no replay, transcript and URL retained.
+			h.mu.Lock()
+			clearPendingBinding(sess)
+			h.appendSent(sentEntry{Event: "failed", Session: sid, URL: sess.URL, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(allTurns), Note: "binding missing-or-invalid-target kind=" + kind})
+			h.saveLocked()
+			h.mu.Unlock()
+			log.Printf("[openai] session=%s thread-bind-refused reason=missing-or-invalid-target turn=%d/%d kind=%s", shortSID(sid), i+1, len(allTurns), kind)
+			h.writeError(w, http.StatusBadGateway, "server_error", "BACKEND FAILURE: thread binding missing-or-invalid-target; nothing was sent and no new chat was started.")
+			return
+		}
 		log.Printf("[gemini-flow] id=%s session=%s stage=request turn=%d/%d replay=%v fresh=%v prompt_bytes=%d tools=%d stream=%v", fid, shortSID(sid), i+1, len(allTurns), t.replay, turnFresh, len(t.prompt), len(req.Tools), req.Stream)
 		log.Printf("[openai] session=%s stage=browser-start turn=%d/%d fresh=%v prompt_bytes=%d tools=%d", shortSID(sid), i+1, len(allTurns), turnFresh, len(t.prompt), len(req.Tools))
+		// Intent is journaled per imminent chunk — replay vs final
+		// distinguished — with a durable save BEFORE submission, so the
+		// log never claims the final turn submitted while only history
+		// imports are in flight.
+		h.mu.Lock()
+		h.appendSent(sentEntry{Event: "submitted", Session: sid, URL: bound, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(allTurns), Note: "kind=" + kind})
+		h.saveLocked()
+		h.mu.Unlock()
 		var turnImages []gemini.ResponseImage
 		var terr error
-		answer, turnImages, terr = h.askTurn(gemini.WithFlowID(gemini.WithTurnIdentity(r.Context(), sid+"\x00"+hash), fid), t.prompt, turnFresh)
+		answer, turnImages, terr = h.askTurnOnThread(gemini.WithFlowID(gemini.WithTurnIdentity(r.Context(), sid+"\x00"+hash), fid), t.prompt, bound, turnFresh)
 		if terr != nil {
 			log.Printf("[gemini-flow] id=%s session=%s stage=browser_result turn=%d/%d result=error duration=%s not_submitted=%v err=%v", fid, shortSID(sid), i+1, len(allTurns), time.Since(started).Round(time.Millisecond), errors.Is(terr, gemini.ErrNotSubmitted), terr)
 			log.Printf("[openai] session=%s stage=browser-failed turn=%d/%d duration=%s not_submitted=%v", shortSID(sid), i+1, len(allTurns), time.Since(started).Round(time.Millisecond), errors.Is(terr, gemini.ErrNotSubmitted))
@@ -936,8 +1020,27 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.writeError(w, http.StatusUnprocessableEntity, "invalid_request_error", unknown+" "+next)
 				return
 			}
+			if errors.Is(err, gemini.ErrThreadBinding) {
+				// Binding restore failed (or the tab sat on the wrong
+				// conversation): provably nothing was typed or sent. No
+				// fallback new chat, no replay — transcript and saved URL
+				// are retained, pending is cleared, the person retries.
+				log.Printf("[openai] session=%s thread-bind-refused turn=%d/%d kind=%s not_submitted=%v", shortSID(sid), i+1, len(allTurns), kind, gemini.IsPreSubmit(err))
+				h.writeError(w, http.StatusBadGateway, "server_error", "BACKEND FAILURE: thread binding failed ("+err.Error()+"); nothing was sent and no new chat was started. The saved thread and transcript are retained; retry the same request.")
+				return
+			}
 			h.writeError(w, http.StatusBadGateway, "server_error", "BACKEND FAILURE: "+err.Error())
 			return
+		}
+		// Chunk succeeded: capture the thread URL for binding the next
+		// chunk. Only a valid conversation URL is ever adopted, and on an
+		// established delta the saved URL wins over any drift.
+		if cur := h.currentThreadURL(r.Context()); gemini.ValidThreadURL(cur) {
+			if bound == "" || fresh || reseedPlan != nil {
+				bound = cur
+			} else if cur != bound {
+				log.Printf("[openai] session=%s thread-url-drift-ignored turn=%d/%d", shortSID(sid), i+1, len(allTurns))
+			}
 		}
 		if t.replay {
 			// History imports are inert: the model must acknowledge without
@@ -1007,8 +1110,14 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	sess.LastCreated = created
 	sess.LastToolIDs = toolIDs
 	clearPendingBinding(sess)
-	if postURL := h.currentThreadURL(r.Context()); postURL != "" {
-		sess.URL = postURL
+	// Commit the bound thread URL only: a valid bound URL is adopted for
+	// fresh/reseed turns that minted it; an established delta keeps its
+	// saved URL. A probe reporting the homepage or anything else never
+	// overwrites the journal.
+	if gemini.ValidThreadURL(bound) && (sess.URL == "" || fresh || reseedPlan != nil || bound == sess.URL) {
+		sess.URL = bound
+	} else if bound != sess.URL {
+		log.Printf("[openai] session=%s thread-url-retained", shortSID(sid))
 	}
 	h.appendSent(sentEntry{Event: "completed", Session: sid, URL: sess.URL, PromptHash: promptHash(finalPrompt), Bytes: len(finalPrompt), Chunk: 1, Chunks: 1, AnswerHash: gemini.AnswerHash(answer)})
 	if reseedPlan != nil {

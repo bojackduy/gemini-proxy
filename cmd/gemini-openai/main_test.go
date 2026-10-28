@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -603,6 +604,18 @@ type fakeRecoveryBackend struct {
 	prompts    []string
 	freshFlags []bool
 	answerFor  func(prompt string) string
+	// Thread-binding simulation: boundURLs records the bound target per
+	// thread-aware submit; mintURL is adopted as urlNow on fresh submits
+	// (new-chat mint); restoreTo is adopted on bound submits (rebuild
+	// routed back); ensureErr fails bound submits with zero sends.
+	// dropToHomeAfter simulates a tab rebuild between chunks: when set,
+	// every continuation submit finds the tab freshly rebuilt on the
+	// homepage and must be routed back via restoreTo before sending.
+	boundURLs       []string
+	mintURL         string
+	restoreTo       string
+	ensureErr       error
+	dropToHomeAfter int
 }
 
 func (f *fakeRecoveryBackend) Ask(_ context.Context, prompt string, newSession bool, _ time.Duration) (string, error) {
@@ -634,6 +647,52 @@ func (f *fakeRecoveryBackend) ReadThreadTurn(_ context.Context, url, prompt stri
 func (f *fakeRecoveryBackend) ReadLatestThreadTurn(_ context.Context, url string) (string, gemini.TurnResult, error) {
 	f.latests++
 	return f.readLatest(url)
+}
+
+// Thread binding double: records the bound target per submit and enforces
+// it like the real client. restoreTo simulates a tab rebuild routed back:
+// when set, binding calls move urlNow to restoreTo (the saved thread)
+// before submitting. ensureErr simulates a failed restore: binding calls
+// return it with zero submits.
+func (f *fakeRecoveryBackend) AskWithImagesThread(_ context.Context, prompt, threadURL string, newSession bool, _ time.Duration) (string, []gemini.ResponseImage, error) {
+	f.boundURLs = append(f.boundURLs, threadURL)
+	if newSession {
+		// Fresh chats mint their thread; later chunks bind the minted URL.
+		if f.mintURL != "" {
+			f.urlNow = f.mintURL
+		}
+		s, err := f.Ask(context.Background(), prompt, true, 0)
+		return s, nil, err
+	}
+	if f.ensureErr != nil {
+		return "", nil, f.ensureErr
+	}
+	if !gemini.ValidThreadURL(threadURL) {
+		return "", nil, threadBindingErr()
+	}
+	// A tab rebuilt between chunks sits on the homepage at submit time;
+	// the binding routes it back before anything is sent.
+	if f.dropToHomeAfter > 0 {
+		f.urlNow = geminiHomePage()
+	}
+	// A rebuilt tab (homepage) is routed back before any submit.
+	if f.restoreTo != "" {
+		f.urlNow = f.restoreTo
+	}
+	if threadURL != f.urlNow {
+		return "", nil, threadBindingErr()
+	}
+	s, err := f.Ask(context.Background(), prompt, false, 0)
+	return s, nil, err
+}
+
+func (f *fakeRecoveryBackend) AskThread(_ context.Context, prompt, threadURL string, newSession bool, d time.Duration) (string, error) {
+	s, _, err := f.AskWithImagesThread(context.Background(), prompt, threadURL, newSession, d)
+	return s, err
+}
+
+func threadBindingErr() error {
+	return fmt.Errorf("thread binding wrong-conversation: %w", gemini.ErrThreadBinding)
 }
 
 // fakeReadyBackend reports a signed-in tab so readiness paths can be exercised
@@ -1064,7 +1123,9 @@ func TestLoadBearingUnknownContinuesFresh(t *testing.T) {
 }
 
 func TestHappyPathAppendUnchanged(t *testing.T) {
-	fake := &fakeRecoveryBackend{askAnswer: "delta answer"}
+	// Tab sits on the stored thread: delta binds it and sends only the
+	// suffix.
+	fake := &fakeRecoveryBackend{askAnswer: "delta answer", urlNow: "https://gemini.google.com/app/OLD"}
 	h := &handler{model: "gemini-web", client: fake, maxChars: 200000,
 		sessions: map[string]*session{
 			"s": {Messages: []message{{Role: "user", Content: "q0"}}, URL: "https://gemini.google.com/app/OLD"},
@@ -1622,23 +1683,36 @@ func TestThreadRejoinAfterSlotLoss(t *testing.T) {
 			t.Fatalf("thread moved: %s", got)
 		}
 	})
-	t.Run("tab moved starts fresh", func(t *testing.T) {
+	t.Run("tab moved fails closed without a new chat", func(t *testing.T) {
 		fake, h := newRejoinHandler("https://gemini.google.com/app/ELSEWHERE")
 		w := postJSON(t, h, "rj", chatRequest{Model: "gemini-web", Messages: incoming})
-		if w.Code != http.StatusOK {
-			t.Fatalf("moved tab: %d %s", w.Code, w.Body.String())
+		if w.Code == http.StatusOK {
+			t.Fatalf("moved tab must refuse, got 200 %s", w.Body.String())
 		}
-		if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
-			t.Fatalf("moved tab must start a new chat, never append: fresh=%v", fake.freshFlags)
+		if fake.asks != 0 {
+			t.Fatalf("zero sends when the tab left the saved thread: asks=%d", fake.asks)
+		}
+		for _, p := range fake.prompts {
+			if strings.Contains(p, "HISTORY IMPORT") || strings.Contains(p, "PRIOR EXECUTION RECORD") {
+				t.Fatalf("no replacement chat on a moved tab: %q", p)
+			}
+		}
+		if got := h.sessions["rj"].URL; got != threadURL {
+			t.Fatalf("saved thread retained: %s", got)
+		}
+		if h.sessions["rj"].Pending {
+			t.Fatalf("pending must clear on proved pre-submit failure")
 		}
 	})
 }
 
-func TestTolerantPrefixAbsorbsEchoBloat(t *testing.T) {
-	// Live shape: our 130-byte answer re-echoed with ~637 appended chars.
-	// Strict compare reseeded a new chat every turn; tolerant compare
-	// continues delta with only the new question submitted.
-	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/THREAD"}
+func TestAssistantEchoBloatAbsorbed(t *testing.T) {
+	// Live shape: our 130-byte committed answer re-echoed with ~637
+	// appended re-render bytes. The echo is an assistant-role append of
+	// our own bytes, so the turn continues delta on the bound thread
+	// instead of reseeding a new chat every turn. User/system/tool
+	// appends stay significant (companion tests below).
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/THREAD", mintURL: "https://gemini.google.com/app/NEW2"}
 	fake.answerFor = func(prompt string) string {
 		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
 			return "ACK"
@@ -1652,7 +1726,6 @@ func TestTolerantPrefixAbsorbsEchoBloat(t *testing.T) {
 			{Role: "assistant", Content: strings.Repeat("x", 130)},
 		}, URL: "https://gemini.google.com/app/THREAD"}}}
 	h.gate <- struct{}{}
-	h.hasActive, h.activeSID = true, "tol"
 	incoming := []message{
 		{Role: "user", Content: "q"},
 		{Role: "assistant", Content: strings.Repeat("x", 130) + strings.Repeat("y", 637)},
@@ -1663,20 +1736,17 @@ func TestTolerantPrefixAbsorbsEchoBloat(t *testing.T) {
 		t.Fatalf("echo bloat must continue delta: %d %s", w.Code, w.Body.String())
 	}
 	if fake.asks != 1 || len(fake.freshFlags) != 1 || fake.freshFlags[0] {
-		t.Fatalf("one delta submit on the same thread: asks=%d fresh=%v", fake.asks, fake.freshFlags)
-	}
-	if strings.Contains(fake.prompts[0], "HISTORY IMPORT") {
-		t.Fatalf("no import on absorbed echo: %q", fake.prompts[0][:120])
+		t.Fatalf("one delta submit on the bound thread: asks=%d fresh=%v", fake.asks, fake.freshFlags)
 	}
 	if got := h.sessions["tol"].URL; got != "https://gemini.google.com/app/THREAD" {
 		t.Fatalf("thread moved: %s", got)
 	}
 }
 
-func TestOverBoundAppendStillReseeds(t *testing.T) {
-	// Same shape but 2000 appended bytes: beyond tolerance, must reseed
-	// fresh rather than silently drop a possible user edit.
-	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW2"}
+func TestAssistantOverBoundAppendStillReseeds(t *testing.T) {
+	// Same shape at +2000B: beyond tolerance, so it reseeds fresh rather
+	// than risk silently dropping a genuine user edit to our answer.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW2", mintURL: "https://gemini.google.com/app/NEW2"}
 	fake.answerFor = func(prompt string) string {
 		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
 			return "ACK"
@@ -1690,7 +1760,6 @@ func TestOverBoundAppendStillReseeds(t *testing.T) {
 			{Role: "assistant", Content: strings.Repeat("x", 130)},
 		}, URL: "https://gemini.google.com/app/THREAD"}}}
 	h.gate <- struct{}{}
-	h.hasActive, h.activeSID = true, "tol2"
 	incoming := []message{
 		{Role: "user", Content: "q"},
 		{Role: "assistant", Content: strings.Repeat("x", 130) + strings.Repeat("y", 2000)},
@@ -1704,3 +1773,350 @@ func TestOverBoundAppendStillReseeds(t *testing.T) {
 		t.Fatalf("over-bound divergence must start a new chat: fresh=%v", fake.freshFlags)
 	}
 }
+
+func TestUnknownUserSuffixNotIgnored(t *testing.T) {
+	// A user-message edit (same length class, different tail) is real
+	// intent: delta is refused and the full timeline travels.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/THREAD", mintURL: "https://gemini.google.com/app/NEW3"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fine"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions: map[string]*session{"u": {Messages: []message{
+			{Role: "user", Content: "deploy to staging"},
+		}, URL: "https://gemini.google.com/app/THREAD"}}}
+	h.gate <- struct{}{}
+	incoming := []message{{Role: "user", Content: "deploy to production"}}
+	w := postJSON(t, h, "u", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("user rewrite must reseed, not refuse: %d %s", w.Code, w.Body.String())
+	}
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+		t.Fatalf("edited user message must not delta: fresh=%v", fake.freshFlags)
+	}
+	joined := strings.Join(fake.prompts, "\n")
+	if !strings.Contains(joined, "deploy to production") {
+		t.Fatalf("edited text must travel in full: %q", joined)
+	}
+}
+
+func TestTwoConsecutivePromptsSameURL(t *testing.T) {
+	// One session, two turns: the second sends only its suffix on the
+	// same thread, with zero imports.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/STEADY", mintURL: "https://gemini.google.com/app/STEADY"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "answer text"
+	}
+	dir := t.TempDir()
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(dir, "state.json"), sessions: map[string]*session{}}
+	h.gate <- struct{}{}
+	first := []message{{Role: "user", Content: "first question"}}
+	if w := postJSON(t, h, "steady", chatRequest{Model: "gemini-web", Messages: first}); w.Code != http.StatusOK {
+		t.Fatalf("first turn: %d %s", w.Code, w.Body.String())
+	}
+	thread := h.sessions["steady"].URL
+	if !gemini.ValidThreadURL(thread) {
+		t.Fatalf("first turn must mint a valid thread URL: %q", thread)
+	}
+	second := append(append([]message{}, h.sessions["steady"].Messages...), message{Role: "user", Content: "second question"})
+	fake.prompts, fake.freshFlags, fake.asks, fake.boundURLs = nil, nil, 0, nil
+	if w := postJSON(t, h, "steady", chatRequest{Model: "gemini-web", Messages: second}); w.Code != http.StatusOK {
+		t.Fatalf("second turn: %d %s", w.Code, w.Body.String())
+	}
+	if fake.asks != 1 {
+		t.Fatalf("second turn must submit once, got %d: %q", fake.asks, fake.prompts)
+	}
+	if len(fake.freshFlags) != 1 || fake.freshFlags[0] {
+		t.Fatalf("second turn must continue (fresh=false): %v", fake.freshFlags)
+	}
+	if len(fake.boundURLs) != 1 || fake.boundURLs[0] != thread {
+		t.Fatalf("second turn must bind the saved thread: %q", fake.boundURLs)
+	}
+	if got := h.sessions["steady"].URL; got != thread {
+		t.Fatalf("thread must not move on delta: %q", got)
+	}
+	if strings.Contains(fake.prompts[0], "HISTORY IMPORT") {
+		t.Fatalf("no import on a clean continuation: %q", fake.prompts[0])
+	}
+}
+
+func TestSerializedReloadRestoresURL(t *testing.T) {
+	// The saved thread URL survives an adapter restart via the state file.
+	dir := t.TempDir()
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/RELOAD", mintURL: "https://gemini.google.com/app/RELOAD"}
+	fake.answerFor = func(prompt string) string { return "ok" }
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(dir, "state.json"), sessions: map[string]*session{}}
+	h.gate <- struct{}{}
+	if w := postJSON(t, h, "rl", chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "hi"}}}); w.Code != http.StatusOK {
+		t.Fatalf("first turn: %d %s", w.Code, w.Body.String())
+	}
+	h2 := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(dir, "state.json")}
+	h2.gate <- struct{}{}
+	if err := h2.load(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	s := h2.sessions["rl"]
+	if s == nil || !gemini.ValidThreadURL(s.URL) {
+		t.Fatalf("reloaded journal must carry the thread URL: %+v", s)
+	}
+	if len(s.Messages) != 2 {
+		t.Fatalf("reloaded journal must carry the transcript: %d messages", len(s.Messages))
+	}
+}
+
+func TestAlternatingSessionsKeepTargets(t *testing.T) {
+	// A->B->A: each submit binds its own session's thread, never the
+	// other session's.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/SHARED"}
+	fake.answerFor = func(prompt string) string { return "ok" }
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"), sessions: map[string]*session{}}
+	h.gate <- struct{}{}
+	mkURL := func(id string) string { return "https://gemini.google.com/app/" + id }
+	for _, sid := range []string{"A", "B"} {
+		fake.mintURL = mkURL("THREAD" + sid)
+		if w := postJSON(t, h, sid, chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "hello " + sid}}}); w.Code != http.StatusOK {
+			t.Fatalf("first %s: %d %s", sid, w.Code, w.Body.String())
+		}
+	}
+	if h.sessions["A"].URL == h.sessions["B"].URL {
+		t.Fatalf("sessions must hold distinct threads: %q", h.sessions["A"].URL)
+	}
+	// Interleave continuations: each binds its own thread.
+	for _, sid := range []string{"A", "B", "A"} {
+		fake.urlNow = h.sessions[sid].URL
+		fake.mintURL = ""
+		before := len(fake.boundURLs)
+		next := append(append([]message{}, h.sessions[sid].Messages...), message{Role: "user", Content: "again " + sid})
+		if w := postJSON(t, h, sid, chatRequest{Model: "gemini-web", Messages: next}); w.Code != http.StatusOK {
+			t.Fatalf("continue %s: %d %s", sid, w.Code, w.Body.String())
+		}
+		got := fake.boundURLs[before:]
+		if len(got) != 1 || got[0] != h.sessions[sid].URL {
+			t.Fatalf("%s must bind its own thread: %q session=%q", sid, got, h.sessions[sid].URL)
+		}
+	}
+}
+
+func TestTabRebuiltBeforeRequestRestoresTarget(t *testing.T) {
+	// The tab died and tryEnsure rebuilt it on the homepage: the bound
+	// submit restores the saved thread with zero homepage submits.
+	const thread = "https://gemini.google.com/app/SAVEDTHREAD"
+	fake := &fakeRecoveryBackend{urlNow: geminiHomePage(), restoreTo: thread}
+	fake.answerFor = func(prompt string) string { return "restored answer" }
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions:  map[string]*session{"rb": {Messages: []message{{Role: "user", Content: "q0"}}, URL: thread}}}
+	h.gate <- struct{}{}
+	incoming := []message{{Role: "user", Content: "q0"}, {Role: "user", Content: "q1"}}
+	if w := postJSON(t, h, "rb", chatRequest{Model: "gemini-web", Messages: incoming}); w.Code != http.StatusOK {
+		t.Fatalf("restored submit: %d %s", w.Code, w.Body.String())
+	}
+	if len(fake.freshFlags) == 0 || fake.freshFlags[0] {
+		t.Fatalf("restored tab must delta, never mint: fresh=%v", fake.freshFlags)
+	}
+	if len(fake.boundURLs) == 0 || fake.boundURLs[0] != thread {
+		t.Fatalf("submit must bind the saved thread: %q", fake.boundURLs)
+	}
+	if got := h.sessions["rb"].URL; got != thread {
+		t.Fatalf("journal must keep the saved thread: %q", got)
+	}
+}
+
+func TestRebuildBetweenChunksRestoresTarget(t *testing.T) {
+	// A fresh reseed travels as import + final. The tab rebuilds on the
+	// homepage between the two chunks; the final still binds the minted
+	// thread — the suffix never lands on the homepage.
+	const minted = "https://gemini.google.com/app/MINTEDBETWEEN"
+	fake := &fakeRecoveryBackend{urlNow: geminiHomePage(), mintURL: minted, restoreTo: minted, dropToHomeAfter: 1}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "reseeded answer"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions:  map[string]*session{"bc": {Messages: committedWeatherHistory(), URL: "https://gemini.google.com/app/OLD"}}}
+	h.gate <- struct{}{}
+	incoming := []message{{Role: "user", Content: "weather?"}, {Role: "user", Content: "something else"}}
+	w := postJSON(t, h, "bc", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("reseed across rebuild: %d %s", w.Code, w.Body.String())
+	}
+	if fake.asks < 2 {
+		t.Fatalf("import plus final expected, got %d asks %q", fake.asks, fake.prompts)
+	}
+	last := fake.boundURLs[len(fake.boundURLs)-1]
+	if last != minted {
+		t.Fatalf("final chunk must bind the minted thread: %q", fake.boundURLs)
+	}
+	if got := h.sessions["bc"].URL; got != minted {
+		t.Fatalf("journal must adopt the minted thread: %q", got)
+	}
+}
+
+func TestUnknownSystemSuffixNotIgnored(t *testing.T) {
+	// A rewritten system message is significant too: no delta, full
+	// timeline travels on a new thread.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/THREAD", mintURL: "https://gemini.google.com/app/NEWSYS"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fine"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions: map[string]*session{"sy": {Messages: []message{
+			{Role: "system", Content: "you are a cat"},
+			{Role: "user", Content: "q"},
+		}, URL: "https://gemini.google.com/app/THREAD"}}}
+	h.gate <- struct{}{}
+	incoming := []message{
+		{Role: "system", Content: "you are a dog"},
+		{Role: "user", Content: "q"},
+		{Role: "user", Content: "next"},
+	}
+	w := postJSON(t, h, "sy", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("system rewrite must reseed, not refuse: %d %s", w.Code, w.Body.String())
+	}
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+		t.Fatalf("edited system message must not delta: fresh=%v", fake.freshFlags)
+	}
+}
+
+func TestFailedRestoreZeroSend(t *testing.T) {
+	// Restore fails (auth/challenge/redirect class): zero sends, zero
+	// replacement chat, URL and transcript retained, pending cleared.
+	const thread = "https://gemini.google.com/app/STUCKTHREAD"
+	fake := &fakeRecoveryBackend{urlNow: geminiHomePage(), ensureErr: threadBindingErr()}
+	fake.answerFor = func(prompt string) string { return "must not send" }
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions:  map[string]*session{"st": {Messages: []message{{Role: "user", Content: "q0"}}, URL: thread}}}
+	h.gate <- struct{}{}
+	incoming := []message{{Role: "user", Content: "q0"}, {Role: "user", Content: "q1"}}
+	if w := postJSON(t, h, "st", chatRequest{Model: "gemini-web", Messages: incoming}); w.Code == http.StatusOK {
+		t.Fatalf("failed restore must refuse, got 200 %s", w.Body.String())
+	}
+	if fake.asks != 0 {
+		t.Fatalf("zero sends on failed restore: asks=%d", fake.asks)
+	}
+	for _, p := range fake.prompts {
+		if strings.Contains(p, "HISTORY IMPORT") || strings.Contains(p, "PRIOR EXECUTION RECORD") {
+			t.Fatalf("no replacement chat on failed restore: %q", p)
+		}
+	}
+	s := h.sessions["st"]
+	if s.URL != thread || len(s.Messages) != 1 {
+		t.Fatalf("URL and transcript retained: url=%q msgs=%d", s.URL, len(s.Messages))
+	}
+	if s.Pending {
+		t.Fatalf("pending must clear on proved pre-submit failure")
+	}
+}
+
+func TestInvalidBindingRefused(t *testing.T) {
+	// Homepage or empty journal URLs are never continuation targets: no
+	// delta submit may bind them.
+	for name, url := range map[string]string{"homepage": geminiHomePage(), "empty": ""} {
+		t.Run(name, func(t *testing.T) {
+			fake := &fakeRecoveryBackend{urlNow: geminiHomePage()}
+			fake.answerFor = func(prompt string) string { return "must not send" }
+			h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+				statePath: filepath.Join(t.TempDir(), "state.json"),
+				sessions:  map[string]*session{"bad": {Messages: []message{{Role: "user", Content: "q0"}}, URL: url}}}
+			h.gate <- struct{}{}
+			incoming := []message{{Role: "user", Content: "q0"}, {Role: "user", Content: "q1"}}
+			postJSON(t, h, "bad", chatRequest{Model: "gemini-web", Messages: incoming})
+			// Every recorded submit is either fresh (unbound mint) or
+			// bound to a valid URL — never the invalid journal URL, and
+			// never a delta (fresh=false) at all here.
+			for i, b := range fake.boundURLs {
+				if !fake.freshFlags[i] && b == url {
+					t.Fatalf("invalid URL must never be a continuation target: %q", b)
+				}
+				if b != "" && !gemini.ValidThreadURL(b) {
+					t.Fatalf("only valid URLs are bindable: %q", b)
+				}
+			}
+			for _, f := range fake.freshFlags {
+				if !f {
+					t.Fatalf("no delta may run without a valid binding: %v", fake.freshFlags)
+				}
+			}
+		})
+	}
+}
+
+func TestFreshAuthorizesExactlyOneThread(t *testing.T) {
+	// A genuine fresh session mints exactly one thread: chunk 1 submits
+	// fresh, every later chunk binds the minted URL.
+	fake := &fakeRecoveryBackend{urlNow: geminiHomePage(), mintURL: "https://gemini.google.com/app/MINTED1"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fresh answer"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"), sessions: map[string]*session{}}
+	h.gate <- struct{}{}
+	incoming := []message{{Role: "user", Content: "weather?"}, {Role: "user", Content: "something else"}}
+	w := postJSON(t, h, "fr", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("fresh: %d %s", w.Code, w.Body.String())
+	}
+	freshCount := 0
+	for _, f := range fake.freshFlags {
+		if f {
+			freshCount++
+		}
+	}
+	if freshCount != 1 {
+		t.Fatalf("exactly one fresh submit per new session: fresh=%v", fake.freshFlags)
+	}
+	if got := h.sessions["fr"].URL; got != "https://gemini.google.com/app/MINTED1" {
+		t.Fatalf("journal must adopt the minted thread: %q", got)
+	}
+}
+
+func TestDeltaPerformsNoToolReplay(t *testing.T) {
+	// A delta continuation submits only the suffix with no history
+	// imports, so committed tool calls are never re-executed.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NOTOOLS"}
+	fake.answerFor = func(prompt string) string { return "plain answer" }
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions:  map[string]*session{"nr": {Messages: committedWeatherHistory(), URL: "https://gemini.google.com/app/NOTOOLS"}}}
+	h.gate <- struct{}{}
+	next := append(append([]message{}, h.sessions["nr"].Messages...), message{Role: "user", Content: "and tomorrow?"})
+	w := postJSON(t, h, "nr", chatRequest{Model: "gemini-web", Messages: next, Tools: weatherTools()})
+	if w.Code != http.StatusOK {
+		t.Fatalf("delta with tools: %d %s", w.Code, w.Body.String())
+	}
+	if fake.asks != 1 {
+		t.Fatalf("one suffix submit, got %d", fake.asks)
+	}
+	joined := strings.Join(fake.prompts, "\n")
+	if strings.Contains(joined, "HISTORY IMPORT") || strings.Contains(joined, "PRIOR EXECUTION RECORD") {
+		t.Fatalf("delta must not import history: %q", joined)
+	}
+	if strings.Contains(joined, "call_1") {
+		t.Fatalf("delta must not replay committed tool calls: %q", joined)
+	}
+}
+
+func geminiHomePage() string { return "https://gemini.google.com/app" }

@@ -61,13 +61,55 @@ var (
 	// wrap ErrNotSubmitted, so callers cannot downgrade it to a safe retry.
 	ErrForeignDraft = errors.New("composer holds a draft this bridge cannot verify; refusing to overwrite it")
 	ErrDraftOwned   = errors.New("composer holds this bridge's own draft from a turn whose submission may have been dispatched; refusing to touch it")
+	// ErrThreadBinding marks a refusal to submit anywhere except the
+	// session's saved thread URL: restore failed, the tab sits on a
+	// different conversation, or auth/challenge/redirect blocks the
+	// restore. It always wraps ErrNotSubmitted too (see threadFail), so
+	// both errors.Is(err, ErrNotSubmitted) and IsPreSubmit stay true:
+	// provably nothing was typed or sent.
+	ErrThreadBinding = errors.New("saved thread unavailable; refusing to submit elsewhere")
 )
+
+// ValidThreadURL reports whether u is an exact Gemini conversation URL the
+// bridge may submit to: HomePage plus a non-empty conversation id. The bare
+// HomePage (fresh-chat landing, no thread) is never a valid binding target,
+// so a rebuilt tab sitting on it can never satisfy a delta submit.
+func ValidThreadURL(u string) bool {
+	const prefix = "https://gemini.google.com/app/"
+	if !strings.HasPrefix(u, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(u, prefix)
+	rest = strings.TrimSuffix(rest, "/")
+	if i := strings.IndexAny(rest, "?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	if rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '=' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// threadFail builds the typed pre-submit binding failure: provably nothing
+// was typed or sent. reason is a fixed code (counts/flags only, never URLs
+// or content): missing-or-invalid-target, wrong-conversation,
+// restore-redirect, restore-auth, restore-challenge, restore-navigate,
+// binding-unsupported.
+func threadFail(reason string) error {
+	return fmt.Errorf("thread binding %s: %w", reason, errors.Join(ErrNotSubmitted, ErrThreadBinding))
+}
 
 // IsPreSubmit reports a failure proven to have happened before any submission
 // action, so the session stays clean instead of becoming uncertain. It does NOT
 // imply retrying helps: a foreign draft is pre-submit yet needs a person.
 func IsPreSubmit(err error) bool {
-	return errors.Is(err, ErrNotSubmitted) || errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrDraftOwned)
+	return errors.Is(err, ErrNotSubmitted) || errors.Is(err, ErrForeignDraft) || errors.Is(err, ErrDraftOwned) || errors.Is(err, ErrThreadBinding)
 }
 
 // IsNavigateError reports a page-navigation failure. All navigate steps run
@@ -696,6 +738,94 @@ func (c *Client) AskWithImages(ctx context.Context, prompt string, newSession bo
 	return c.askRich(ctx, prompt, newSession, timeout, true)
 }
 
+// AskThread sends prompt bound to threadURL: for continuations the tab is
+// restored to and verified on the saved thread after prepare and again
+// immediately before typing, inside the same tab lock that submits. A fresh
+// chat (newSession) ignores the binding and mints its thread; the caller
+// binds later chunks to the minted URL. Every binding failure is a typed
+// pre-submit refusal with zero typing and zero sends.
+func (c *Client) AskThread(ctx context.Context, prompt, threadURL string, newSession bool, timeout time.Duration) (string, error) {
+	text, _, err := c.askRichThread(ctx, prompt, threadURL, newSession, timeout, false)
+	return text, err
+}
+
+// AskWithImagesThread is AskThread with retrievable output-image parts.
+func (c *Client) AskWithImagesThread(ctx context.Context, prompt, threadURL string, newSession bool, timeout time.Duration) (string, []ResponseImage, error) {
+	return c.askRichThread(ctx, prompt, threadURL, newSession, timeout, true)
+}
+
+// askRichThread is the thread-bound submit-and-wait flow. Fresh turns behave
+// exactly like askRich; continuation turns verify the saved thread under the
+// submit lock so a reconnect between prepare and typing cannot strand the
+// suffix on a rebuilt homepage tab.
+func (c *Client) askRichThread(ctx context.Context, prompt, threadURL string, newSession bool, timeout time.Duration, collectImages bool) (text string, images []ResponseImage, err error) {
+	if strings.TrimSpace(prompt) == "" {
+		return "", nil, errors.New("prompt must not be empty")
+	}
+	if !newSession && !ValidThreadURL(threadURL) {
+		return "", nil, threadFail("missing-or-invalid-target")
+	}
+	if timeout <= 0 || timeout > 30*time.Minute {
+		timeout = DefaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	id := flowID(ctx)
+	if id == "" {
+		id = NewFlowID()
+		ctx = WithFlowID(ctx, id)
+	}
+	started := time.Now()
+	log.Printf("[gemini-flow] id=%s stage=start prompt_bytes=%d new_session=%v timeout=%s", id, len(prompt), newSession, timeout)
+	defer func() {
+		log.Printf("[gemini-flow] id=%s stage=finish err=%v answer_bytes=%d images=%d duration=%s",
+			id, err, len(text), len(images), time.Since(started).Round(time.Millisecond))
+	}()
+
+	prepStart := time.Now()
+	log.Printf("[gemini-flow] id=%s stage=prepare start new_session=%v", id, newSession)
+	beforeIDs, err := c.prepareSubmission(ctx, prompt, newSession)
+	if err != nil {
+		log.Printf("[gemini-flow] id=%s stage=prepare result=error duration=%s err=%v", id, time.Since(prepStart).Round(time.Millisecond), err)
+		return "", nil, err
+	}
+	log.Printf("[gemini-flow] id=%s stage=prepare result=ok prior_answers=%d duration=%s", id, len(beforeIDs), time.Since(prepStart).Round(time.Millisecond))
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !newSession {
+		if verr := c.verifyThreadLocked(ctx, threadURL); verr != nil {
+			return "", nil, verr
+		}
+	}
+	if err := c.typeAndSubmitLocked(ctx, prompt); err != nil {
+		return "", nil, err
+	}
+	html, err := c.waitForAnswerLocked(ctx, beforeIDs)
+	if err != nil {
+		return "", nil, err
+	}
+	if !collectImages {
+		text := ConvertResponseHTML(html)
+		if strings.TrimSpace(text) == "" {
+			return "", nil, ErrMissingAnswer
+		}
+		return text, nil, nil
+	}
+	live := c.collectLiveImagesLocked(ctx)
+	text, parts := ConvertResponseWithLiveImages(html, live.Imgs, live.Canvas)
+	if strings.TrimSpace(text) == "" && len(parts) == 0 {
+		return "", nil, ErrMissingAnswer
+	}
+	// An image-only answer still needs text beside the parts: the fixtures
+	// above guarantee non-empty text whenever nodes were seen; an empty
+	// fragment with live pixels alone keeps the parts with a short note.
+	if strings.TrimSpace(text) == "" {
+		text = "[Image: model-generated visual content]"
+	}
+	return text, parts, nil
+}
+
 // askRich is the shared submit-and-wait flow for Ask/AskWithImages.
 // With collectImages it additionally resolves image bytes read-only after
 // the answer stabilizes; without it the behavior is exactly Ask's.
@@ -880,6 +1010,92 @@ func (c *Client) newChatLocked(ctx context.Context) error {
 		return fmt.Errorf("navigate: %w", err)
 	}
 	return nil
+}
+
+// currentURLLocked reports the owned tab's URL. Callers must hold c.mu.
+func (c *Client) currentURLLocked(ctx context.Context) (string, error) {
+	rctx, cancel := operationContext(c.tab, ctx, 10*time.Second)
+	defer cancel()
+	var url string
+	if err := chromedp.Run(rctx, chromedp.Location(&url)); err != nil {
+		return "", fmt.Errorf("navigate: thread location unreadable: %v", err)
+	}
+	return url, nil
+}
+
+// verifyThreadLocked restores and verifies the owned tab sits on threadURL.
+// Callers must hold c.mu. It types and submits nothing: every failure is a
+// typed pre-submit binding refusal (see threadFail), never a fallback to a
+// new chat. Lifecycle note: tryEnsureLocked always rebuilds a dead tab on
+// the bare HomePage, so a tab recreated before or between chunks lands on
+// the homepage by design; this verifier routes it back to the saved thread
+// per transaction instead of submitting into the empty chat.
+func (c *Client) verifyThreadLocked(ctx context.Context, threadURL string) error {
+	if !ValidThreadURL(threadURL) {
+		return threadFail("missing-or-invalid-target")
+	}
+	cur, err := c.currentURLLocked(ctx)
+	if err != nil {
+		return threadFail("restore-navigate")
+	}
+	if cur == threadURL {
+		return nil
+	}
+	// The tab is elsewhere (rebuilt homepage, operator-moved tab, redirect
+	// residue): navigate to the saved thread and re-verify exactly.
+	nctx, cancel := operationContext(c.tab, ctx, 60*time.Second)
+	defer cancel()
+	if err := chromedp.Run(nctx, chromedp.Navigate(threadURL)); err != nil {
+		return fmt.Errorf("navigate: thread restore: %w", err)
+	}
+	if err := c.pollPageSettledLocked(nctx); err != nil {
+		return threadFail("restore-navigate")
+	}
+	if c.signInPresent(nctx) {
+		return threadFail("restore-auth")
+	}
+	after, err := c.currentURLLocked(ctx)
+	if err != nil {
+		return threadFail("restore-navigate")
+	}
+	if after != threadURL {
+		return threadFail("restore-redirect")
+	}
+	// Restored onto the thread, but only a signed-in composer proves the
+	// conversation is usable; anything else (challenge, consent, wrong
+	// conversation shell) fails closed.
+	rctx, cancel2 := operationContext(c.tab, ctx, 30*time.Second)
+	defer cancel2()
+	loggedIn := c.anyPresent(rctx, loggedInSelectors) && !c.signInPresent(rctx)
+	if !loggedIn {
+		return threadFail("restore-challenge")
+	}
+	return nil
+}
+
+// EnsureThread binds the owned tab to threadURL: attach/reconnect, auth
+// gate, restore, and exact verification. It never types or submits: safe to
+// call before every chunk. Callers must not hold c.mu.
+func (c *Client) EnsureThread(ctx context.Context, threadURL string) error {
+	if !ValidThreadURL(threadURL) {
+		return threadFail("missing-or-invalid-target")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: ensure canceled: %v", ErrNotSubmitted, err)
+	}
+	if err := c.ensureBrowserLocked(ctx); err != nil {
+		return err
+	}
+	loggedIn, err := c.checkLoggedInLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if !loggedIn {
+		return ErrNotLoggedIn
+	}
+	return c.verifyThreadLocked(ctx, threadURL)
 }
 
 // modelMessageIDsLocked snapshots the current set of model-response nodes so
