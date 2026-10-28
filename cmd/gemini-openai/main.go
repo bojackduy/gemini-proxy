@@ -771,15 +771,21 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// in-memory slot proves it, or — after a restart wiped the slot — a
 	// read-only check that the tab never moved proves it. Anything else
 	// starts a new chat rather than appending to the wrong thread.
-	if reseedPlan == nil && len(sess.Messages) > 0 && len(req.Messages) >= len(sess.Messages) {
-		match := true
-		for i := range sess.Messages {
-			if !canonicalEqual(sess.Messages[i], req.Messages[i]) {
-				match = false
-				break
-			}
-		}
+	if reseedPlan == nil && len(sess.Messages) > 0 {
+		// Tolerant prefix: client echoes of our answers may carry appended
+		// re-render notes (bounded by prefixSkipped). Anything beyond that
+		// fails closed to the fresh/reseed path below.
+		match, skipped := prefixSkipped(sess.Messages, req.Messages, 1024)
 		if match {
+			if skipped > 0 {
+				log.Printf("[openai] session=%s tolerant-prefix skipped=%dB echo-bloat absorbed", shortSID(sid), skipped)
+			}
+			if h.hasActive && h.activeSID == sid {
+				fresh = false
+			} else if sess.URL != "" && h.currentThreadURL(r.Context()) == sess.URL {
+				fresh = false
+				log.Printf("[openai] session=%s thread-rejoin tab still on stored thread; continuing delta", shortSID(sid))
+			}
 			if h.hasActive && h.activeSID == sid {
 				fresh = false
 			} else if sess.URL != "" && h.currentThreadURL(r.Context()) == sess.URL {

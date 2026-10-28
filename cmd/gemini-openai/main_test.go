@@ -1633,3 +1633,74 @@ func TestThreadRejoinAfterSlotLoss(t *testing.T) {
 		}
 	})
 }
+
+func TestTolerantPrefixAbsorbsEchoBloat(t *testing.T) {
+	// Live shape: our 130-byte answer re-echoed with ~637 appended chars.
+	// Strict compare reseeded a new chat every turn; tolerant compare
+	// continues delta with only the new question submitted.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/THREAD"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fine"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions: map[string]*session{"tol": {Messages: []message{
+			{Role: "user", Content: "q"},
+			{Role: "assistant", Content: strings.Repeat("x", 130)},
+		}, URL: "https://gemini.google.com/app/THREAD"}}}
+	h.gate <- struct{}{}
+	h.hasActive, h.activeSID = true, "tol"
+	incoming := []message{
+		{Role: "user", Content: "q"},
+		{Role: "assistant", Content: strings.Repeat("x", 130) + strings.Repeat("y", 637)},
+		{Role: "user", Content: "next"},
+	}
+	w := postJSON(t, h, "tol", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("echo bloat must continue delta: %d %s", w.Code, w.Body.String())
+	}
+	if fake.asks != 1 || len(fake.freshFlags) != 1 || fake.freshFlags[0] {
+		t.Fatalf("one delta submit on the same thread: asks=%d fresh=%v", fake.asks, fake.freshFlags)
+	}
+	if strings.Contains(fake.prompts[0], "HISTORY IMPORT") {
+		t.Fatalf("no import on absorbed echo: %q", fake.prompts[0][:120])
+	}
+	if got := h.sessions["tol"].URL; got != "https://gemini.google.com/app/THREAD" {
+		t.Fatalf("thread moved: %s", got)
+	}
+}
+
+func TestOverBoundAppendStillReseeds(t *testing.T) {
+	// Same shape but 2000 appended bytes: beyond tolerance, must reseed
+	// fresh rather than silently drop a possible user edit.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW2"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fine"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions: map[string]*session{"tol2": {Messages: []message{
+			{Role: "user", Content: "q"},
+			{Role: "assistant", Content: strings.Repeat("x", 130)},
+		}, URL: "https://gemini.google.com/app/THREAD"}}}
+	h.gate <- struct{}{}
+	h.hasActive, h.activeSID = true, "tol2"
+	incoming := []message{
+		{Role: "user", Content: "q"},
+		{Role: "assistant", Content: strings.Repeat("x", 130) + strings.Repeat("y", 2000)},
+		{Role: "user", Content: "next"},
+	}
+	w := postJSON(t, h, "tol2", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("over-bound append: %d %s", w.Code, w.Body.String())
+	}
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+		t.Fatalf("over-bound divergence must start a new chat: fresh=%v", fake.freshFlags)
+	}
+}

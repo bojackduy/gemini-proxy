@@ -160,6 +160,45 @@ func firstMismatch(incoming, saved []message) *prefixMismatch {
 	return nil
 }
 
+// prefixSkipped checks the saved journal is a prefix of the incoming
+// history, tolerating append-only client echo bloat: a saved message may
+// reappear with up to tol appended bytes (the client re-rendering our
+// answers with appended notes). Anything else — truncation, rewrites,
+// role/name/call changes — fails closed to the reseed path. Returns the
+// total skipped bytes for the log. Content-free: lengths only.
+func prefixSkipped(saved, incoming []message, tol int) (bool, int) {
+	if len(incoming) < len(saved) {
+		return false, 0
+	}
+	skipped := 0
+	for i := range saved {
+		if canonicalEqual(saved[i], incoming[i]) {
+			continue
+		}
+		a, b := saved[i], incoming[i]
+		if a.Role != b.Role || a.Name != b.Name || a.ToolCallID != b.ToolCallID {
+			return false, 0
+		}
+		if len(a.ToolCalls) != len(b.ToolCalls) {
+			return false, 0
+		}
+		for j := range a.ToolCalls {
+			other := b.ToolCalls[j]
+			if a.ToolCalls[j].ID != other.ID || a.ToolCalls[j].Type != other.Type ||
+				a.ToolCalls[j].Function.Name != other.Function.Name ||
+				!jsonEqual(a.ToolCalls[j].Function.Arguments, other.Function.Arguments) {
+				return false, 0
+			}
+		}
+		sa, sb := textOf(a), textOf(b)
+		if len(sb) < len(sa) || !strings.HasPrefix(sb, sa) || len(sb)-len(sa) > tol {
+			return false, 0
+		}
+		skipped += len(sb) - len(sa)
+	}
+	return true, skipped
+}
+
 // coherentTranscript reports whether msgs is internally coherent: valid
 // tool-call/result pairing in order (every tool result matches a prior
 // assistant call exactly once, results are nonempty, call IDs are nonempty
