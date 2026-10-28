@@ -2237,3 +2237,144 @@ func TestDirtyAdoptsCompletedTurnAndStaysOnThread(t *testing.T) {
 		t.Fatalf("transcript must extend through the followup: %+v", s.Messages)
 	}
 }
+
+func compactionBase() (saved, incoming []message) {
+	saved = []message{{Role: "system", Content: "Bot instructions. Prior summarized context follows."}}
+	for i := 1; i <= 5; i++ {
+		saved = append(saved,
+			message{Role: "user", Content: "question"},
+			message{Role: "assistant", Content: "answer"})
+	}
+	saved = append(saved, message{Role: "user", Content: "latest question"})
+	// Rewrite only the tail (index 10 of 12): the stored thread already
+	// holds everything before the summary.
+	incoming = append(append([]message{}, saved[:10]...),
+		message{Role: "assistant", Content: "compacted summary of the tail"},
+		message{Role: "user", Content: "followup after compaction"})
+	return saved, incoming
+}
+
+func TestCompactionAppendStaysOnThread(t *testing.T) {
+	saved, incoming := compactionBase()
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/OLD"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "appended answer"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions:  map[string]*session{"s": {Messages: saved, URL: "https://gemini.google.com/app/OLD"}}}
+	h.gate <- struct{}{}
+	h.appendSent(sentEntry{Event: "completed", Session: "s", URL: "https://gemini.google.com/app/OLD",
+		PromptHash: promptHash("prior"), Bytes: 5, Chunk: 1, Chunks: 1, AnswerHash: "abc"})
+	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "appended answer") {
+		t.Fatalf("append continuation: %d %s", w.Code, w.Body.String())
+	}
+	if len(fake.freshFlags) != 2 || fake.freshFlags[0] || fake.freshFlags[1] {
+		t.Fatalf("tail must append on the stored thread, no new chat: fresh=%v asks=%d", fake.freshFlags, fake.asks)
+	}
+	s := h.sessions["s"]
+	if s.URL != "https://gemini.google.com/app/OLD" {
+		t.Fatalf("thread must be kept: %q", s.URL)
+	}
+	if !strings.Contains(s.ReseedEvidence, "compaction-append") || !strings.Contains(s.ReseedEvidence, "same-thread") {
+		t.Fatalf("append evidence missing: %q", s.ReseedEvidence)
+	}
+	if n := len(s.Messages); n != len(incoming)+1 || s.Messages[n-1].Content != "appended answer" {
+		t.Fatalf("journal must follow the compacted history: %+v", s.Messages)
+	}
+	if fake.reads != 0 || fake.latests != 0 {
+		t.Fatalf("append performs no recovery reads: exact=%d latest=%d", fake.reads, fake.latests)
+	}
+}
+
+func TestCompactionEarlyMismatchStillReseeds(t *testing.T) {
+	saved, _ := compactionBase()
+	incoming := append([]message{{Role: "system", Content: "Bot instructions. Prior summarized context follows."},
+		{Role: "user", Content: "rewritten from the start"},
+		{Role: "assistant", Content: "compacted summary of the tail"},
+		{Role: "user", Content: "followup after compaction"}}, saved[4:]...)
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fresh answer"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions:  map[string]*session{"s": {Messages: saved, URL: "https://gemini.google.com/app/OLD"}}}
+	h.gate <- struct{}{}
+	h.appendSent(sentEntry{Event: "completed", Session: "s", URL: "https://gemini.google.com/app/OLD",
+		PromptHash: promptHash("prior"), Bytes: 5, Chunk: 1, Chunks: 1, AnswerHash: "abc"})
+	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("early rewrite must reseed: %d %s", w.Code, w.Body.String())
+	}
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+		t.Fatalf("early divergence must mint a new chat: fresh=%v", fake.freshFlags)
+	}
+	if h.sessions["s"].URL == "https://gemini.google.com/app/OLD" {
+		t.Fatal("reseed must abandon the old thread")
+	}
+}
+
+func TestCompactionWithoutSentProofStillReseeds(t *testing.T) {
+	saved, incoming := compactionBase()
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fresh answer"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions:  map[string]*session{"s": {Messages: saved, URL: "https://gemini.google.com/app/OLD"}}}
+	h.gate <- struct{}{}
+	// No sent-log entry: nothing proves this session drove the stored
+	// thread, so the tail must not be appended to it.
+	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("unproven thread must reseed: %d %s", w.Code, w.Body.String())
+	}
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+		t.Fatalf("unproven thread must mint a new chat: fresh=%v", fake.freshFlags)
+	}
+}
+
+func TestCompactionOnDirtySessionStillReseeds(t *testing.T) {
+	saved, incoming := compactionBase()
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
+	fake.readTurn = func(url, prompt string) (gemini.TurnResult, error) {
+		return gemini.TurnResult{}, structuralMismatch()
+	}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fresh answer"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, adoptWait: time.Millisecond,
+		gate:      make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions: map[string]*session{"s": {Messages: saved, URL: "https://gemini.google.com/app/OLD",
+			Pending: true, PendingPrompt: "uncertain prompt",
+			PendingMessages: append(append([]message{}, saved...), message{Role: "user", Content: "uncertain prompt"})}}}
+	h.gate <- struct{}{}
+	h.appendSent(sentEntry{Event: "completed", Session: "s", URL: "https://gemini.google.com/app/OLD",
+		PromptHash: promptHash("prior"), Bytes: 5, Chunk: 1, Chunks: 1, AnswerHash: "abc"})
+	w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("dirty compaction must reseed: %d %s", w.Code, w.Body.String())
+	}
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+		t.Fatalf("uncertain thread must never be appended to: fresh=%v", fake.freshFlags)
+	}
+	if h.sessions["s"].URL == "https://gemini.google.com/app/OLD" {
+		t.Fatal("dirty reseed must abandon the old thread")
+	}
+}

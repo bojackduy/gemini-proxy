@@ -488,6 +488,23 @@ func (p *rewritePlan) evidence(newURL string, seedBytes int) string {
 		time.Now().UTC().Format(time.RFC3339), p.classification, p.mismatchIndex, p.mismatchField, p.oldURL, newURL, carried, notCarried, seedBytes)
 }
 
+// appendEvidence renders the compaction-append record: same-thread
+// continuation, mismatch position, and the carried/not-carried item lists.
+// Carried exchanges were deliberately NOT re-imported (the stored thread
+// already holds them); they are listed so the lineage stays auditable.
+func (p *rewritePlan) appendEvidence(newURL string, seedBytes int) string {
+	carried := "[]"
+	if len(p.carriedIDs) > 0 {
+		carried = "[" + strings.Join(p.carriedIDs, ",") + "]"
+	}
+	notCarried := "[]"
+	if len(p.notCarried) > 0 {
+		notCarried = "[" + strings.Join(p.notCarried, ",") + "]"
+	}
+	return fmt.Sprintf("compaction-append %s mismatch=%d:%s old=%s new=%s retained-on-thread=%s not-carried=%s seed=%dB same-thread",
+		time.Now().UTC().Format(time.RFC3339), p.mismatchIndex, p.mismatchField, p.oldURL, newURL, carried, notCarried, seedBytes)
+}
+
 // note renders the sent-log form of the linkage: old→new thread plus
 // classification and item lists.
 func (p *rewritePlan) note(newURL string) string {

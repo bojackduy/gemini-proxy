@@ -776,6 +776,14 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var reseedPlan *rewritePlan
+	// dirtyUncertain marks a session that abandoned an uncertain turn
+	// above: its old thread may hold an unverifiable submission, so it
+	// can never be appended to — only reseeded or continued by adoption.
+	dirtyUncertain := false
+	// appending marks a compaction-append: the tail below the mismatch is
+	// submitted onto the stored thread instead of replayed into a new one.
+	appending := false
+	appendStart := 0
 	if sess.Pending {
 		// A record with no binding at all cannot prove what was submitted, so
 		// it is refused fast and names the operator exit.
@@ -823,6 +831,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// so no unverifiable answer gates the new request. Work on a copy
 			// until prompt validation succeeds.
 			reseedPlan = h.planDirtyReseed(sid, sess, req.Messages)
+			dirtyUncertain = true
 			next := *sess
 			next.URL, next.Messages = "", nil
 			next.LastReqHash, next.LastRespID = "", ""
@@ -918,11 +927,38 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if reseedPlan != nil {
 			recordMsgs = reseedPlan.carried
 		}
-		seedMsgs = req.Messages
+		// Compaction with a huge shared prefix: the stored thread already
+		// holds ~everything before the summary, so appending the tail onto
+		// it costs a few pastes instead of a full-thread replay into a new
+		// thread. The summary is meant to supersede the old text; keeping
+		// both costs one stale message of context against recency, which
+		// wins. Never on an uncertain session, never for non-content
+		// rewrites, never without sent-log proof — forks, truncations
+		// and anything unproven keep the reseed path below. Carried
+		// executed exchanges are NOT re-imported: the stored thread
+		// already holds them; they are only listed in the evidence.
+		if reseedPlan != nil && reseedPlan.classification == rewriteCompaction && !dirtyUncertain &&
+			reseedPlan.mismatchField == "content" && len(sess.Messages) > 0 &&
+			reseedPlan.mismatchIndex >= len(sess.Messages)*9/10 &&
+			coherentTranscript(req.Messages) && h.sentEntryForThread(sid, sess.URL) != nil {
+			appending = true
+			appendStart = reseedPlan.mismatchIndex
+			fresh = false
+			seedMsgs = req.Messages[appendStart:]
+			recordMsgs = nil
+			if teach := h.teachReminder(req, sess); teach != "" {
+				sysHead = teach + "\n\n"
+			}
+			log.Printf("[openai] session=%s compaction-append mismatch=%d prefix=%d/%d thread=%s",
+				shortSID(sid), appendStart, appendStart, len(sess.Messages), sess.URL)
+		} else {
+			seedMsgs = req.Messages
+		}
 		// Every new thread is explicitly authorized: genuine fresh (no
 		// committed history) or a classified history rewrite. Anything
 		// else reaching here is the legacy incoherent-input replay.
-		{
+		// Compaction-append mints nothing, so it logs nothing here.
+		if !appending {
 			reason := "legacy-replay"
 			switch {
 			case len(sess.Messages) == 0:
@@ -949,6 +985,12 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	seedBase := 0
 	if !fresh {
 		seedBase = len(sess.Messages)
+		if appending {
+			// The seed starts at the mismatch, below the stored prefix
+			// end: synced offsets map into the incoming history from
+			// there, not from the stored length.
+			seedBase = appendStart
+		}
 	}
 	// One choke point: every turn obeys the paste ceiling before anything
 	// is journaled or submitted.
@@ -1074,7 +1116,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// chunk. Only a valid conversation URL is ever adopted, and on an
 		// established delta the saved URL wins over any drift.
 		if cur := h.currentThreadURL(r.Context()); gemini.ValidThreadURL(cur) {
-			if bound == "" || fresh || reseedPlan != nil {
+			if bound == "" || fresh || (reseedPlan != nil && !appending) {
 				bound = cur
 			} else if cur != bound {
 				log.Printf("[openai] session=%s thread-url-drift-ignored turn=%d/%d", shortSID(sid), i+1, len(allTurns))
@@ -1162,11 +1204,20 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if reseedPlan != nil {
 		// The commit records the linkage: abandoned thread, rewrite
 		// classification, and carried/dropped lists — in the journal
-		// and the sent-log, so both survive adapter restart.
-		sess.ReseedFrom = reseedPlan.oldURL
-		sess.ReseedEvidence = reseedPlan.evidence(sess.URL, len(finalPrompt))
-		h.appendSent(sentEntry{Event: "reseed", Session: sid, URL: sess.URL, PromptHash: promptHash(finalPrompt), Bytes: len(finalPrompt), Note: reseedPlan.note(sess.URL)})
-		log.Printf("[openai] session=%s rewrite-reseed committed %s", shortSID(sid), sess.ReseedEvidence)
+		// and the sent-log, so both survive adapter restart. A
+		// compaction-append continued the stored thread instead of
+		// abandoning it, so it records same-thread evidence.
+		if appending {
+			sess.ReseedFrom = reseedPlan.oldURL
+			sess.ReseedEvidence = reseedPlan.appendEvidence(sess.URL, len(finalPrompt))
+			h.appendSent(sentEntry{Event: "append", Session: sid, URL: sess.URL, PromptHash: promptHash(finalPrompt), Bytes: len(finalPrompt), Note: reseedPlan.note(sess.URL)})
+			log.Printf("[openai] session=%s compaction-append committed %s", shortSID(sid), sess.ReseedEvidence)
+		} else {
+			sess.ReseedFrom = reseedPlan.oldURL
+			sess.ReseedEvidence = reseedPlan.evidence(sess.URL, len(finalPrompt))
+			h.appendSent(sentEntry{Event: "reseed", Session: sid, URL: sess.URL, PromptHash: promptHash(finalPrompt), Bytes: len(finalPrompt), Note: reseedPlan.note(sess.URL)})
+			log.Printf("[openai] session=%s rewrite-reseed committed %s", shortSID(sid), sess.ReseedEvidence)
+		}
 	}
 	h.activeSID, h.hasActive = sid, true
 	h.saveLocked()
