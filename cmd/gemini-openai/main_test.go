@@ -36,6 +36,12 @@ func TestBestEffortPendingContinuationWithoutReadback(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			reads := 0
 			fake := &fakeRecoveryBackend{askAnswer: "fresh answer", urlNow: "https://gemini.google.com/app/NEW"}
+			fake.answerFor = func(prompt string) string {
+				if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+					return "ACK"
+				}
+				return "fresh answer"
+			}
 			fake.readTurn = func(string, string) (gemini.TurnResult, error) {
 				reads++
 				return gemini.TurnResult{}, structuralMismatch()
@@ -55,8 +61,10 @@ func TestBestEffortPendingContinuationWithoutReadback(t *testing.T) {
 			h.gate <- struct{}{}
 			incoming := append(append([]message(nil), pending...), message{Role: "user", Content: "continue with this new request"})
 			w := postJSON(t, h, "s", chatRequest{Model: "gemini-web", Messages: incoming})
-			if reads != 0 || w.Code != http.StatusOK || fake.asks != 1 || !fake.gotFresh {
-				t.Fatalf("new input blocked or read back: reads=%d status=%d asks=%d fresh=%v", reads, w.Code, fake.asks, fake.gotFresh)
+			// Uncertain request plus new request arrive as two user turns:
+			// import plus final in both subtests.
+			if reads != 0 || w.Code != http.StatusOK || fake.asks != 2 || len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+				t.Fatalf("new input blocked or read back: reads=%d status=%d asks=%d fresh=%v", reads, w.Code, fake.asks, fake.freshFlags)
 			}
 			if !strings.Contains(fake.gotPrompt, "continue with this new request") {
 				t.Fatal("new message missing from fresh seed")
@@ -590,14 +598,24 @@ type fakeRecoveryBackend struct {
 	gotPrompt string
 	gotFresh  bool
 	urlNow    string
+	// Multi-turn recording for chunking tests: every prompt and fresh
+	// flag in order. answerFor, when set, answers per prompt.
+	prompts    []string
+	freshFlags []bool
+	answerFor  func(prompt string) string
 }
 
 func (f *fakeRecoveryBackend) Ask(_ context.Context, prompt string, newSession bool, _ time.Duration) (string, error) {
 	f.asks++
 	f.gotPrompt = prompt
 	f.gotFresh = newSession
+	f.prompts = append(f.prompts, prompt)
+	f.freshFlags = append(f.freshFlags, newSession)
 	if f.askErr != nil {
 		return "", f.askErr
+	}
+	if f.answerFor != nil {
+		return f.answerFor(prompt), nil
 	}
 	return f.askAnswer, nil
 }
@@ -902,6 +920,12 @@ func postJSON(t *testing.T, h *handler, sid string, req chatRequest) *httptest.R
 
 func TestCleanReseedCarriesExecutedTools(t *testing.T) {
 	fake := &fakeRecoveryBackend{askAnswer: "fresh answer", urlNow: "https://gemini.google.com/app/NEW"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fresh answer"
+	}
 	h := &handler{model: "gemini-web", client: fake, maxChars: 200000,
 		sessions: map[string]*session{
 			"s": {Messages: committedWeatherHistory(), URL: "https://gemini.google.com/app/OLD"},
@@ -913,14 +937,14 @@ func TestCleanReseedCarriesExecutedTools(t *testing.T) {
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "fresh answer") {
 		t.Fatalf("reseed must continue as a normal submission: %d %s", w.Code, w.Body.String())
 	}
-	if !fake.gotFresh {
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
 		t.Fatal("reseed must abandon the old thread for a fresh Gemini chat")
 	}
-	if !strings.Contains(fake.gotPrompt, "PRIOR EXECUTION RECORD") || !strings.Contains(fake.gotPrompt, "call_1") {
-		t.Fatalf("seed must carry the executed exchange as inert record: %q", fake.gotPrompt)
+	if !strings.Contains(strings.Join(fake.prompts, "\n"), "PRIOR EXECUTION RECORD") || !strings.Contains(strings.Join(fake.prompts, "\n"), "call_1") {
+		t.Fatalf("seed must carry the executed exchange as inert record: %q", fake.prompts)
 	}
-	if !strings.Contains(fake.gotPrompt, "inert") {
-		t.Fatalf("carried calls must render inert, never as pending: %q", fake.gotPrompt)
+	if !strings.Contains(strings.Join(fake.prompts, "\n"), "inert") {
+		t.Fatalf("carried calls must render inert, never as pending: %q", fake.prompts)
 	}
 	s := h.sessions["s"]
 	if len(s.Messages) != len(incoming) {
@@ -953,6 +977,12 @@ func TestDirtyReseedAbandonsUnknown(t *testing.T) {
 			return "", gemini.TurnResult{}, errors.New("stored thread holds no complete assistant answer to adopt")
 		},
 	}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "reseed answer"
+	}
 	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, adoptWait: time.Millisecond,
 		sessions: map[string]*session{
 			"s": {Pending: true, PendingPrompt: "PENDING PROMPT", URL: "https://gemini.google.com/app/OLD",
@@ -975,7 +1005,7 @@ func TestDirtyReseedAbandonsUnknown(t *testing.T) {
 	if !strings.Contains(s.ReseedEvidence, "pending:") || !strings.Contains(s.ReseedEvidence, "never submitted as pending") {
 		t.Fatalf("unknown turn must be listed as not-carried: %q", s.ReseedEvidence)
 	}
-	if !fake.gotFresh {
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
 		t.Fatal("dirty reseed must start a fresh chat, never reuse the uncertain thread")
 	}
 }
@@ -989,6 +1019,12 @@ func TestLoadBearingUnknownContinuesFresh(t *testing.T) {
 		readLatest: func(url string) (string, gemini.TurnResult, error) {
 			return "", gemini.TurnResult{}, errors.New("stored thread holds no complete assistant answer to adopt")
 		},
+	}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fresh answer"
 	}
 	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, adoptWait: time.Millisecond,
 		sessions: map[string]*session{
@@ -1006,14 +1042,14 @@ func TestLoadBearingUnknownContinuesFresh(t *testing.T) {
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "fresh answer") {
 		t.Fatalf("distinct request must continue fresh: %d %s", w.Code, w.Body.String())
 	}
-	if !fake.gotFresh {
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
 		t.Fatal("abandoned chat must never be reused")
 	}
 	if fake.reads != 0 || fake.latests != 0 {
 		t.Fatalf("continuation performed a readback: exact=%d latest=%d", fake.reads, fake.latests)
 	}
-	if fake.asks != 1 {
-		t.Fatalf("expected one fresh submission, got %d", fake.asks)
+	if fake.asks != 2 {
+		t.Fatalf("expected import plus final submission, got %d", fake.asks)
 	}
 	s := h.sessions["s"]
 	if s.Pending || s.PendingPrompt != "" {
@@ -1088,6 +1124,12 @@ func TestReseedEvidenceSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	state := filepath.Join(dir, "openai-sessions.json")
 	fake := &fakeRecoveryBackend{askAnswer: "fresh answer", urlNow: "https://gemini.google.com/app/NEW"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fresh answer"
+	}
 	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, statePath: state,
 		sessions: map[string]*session{
 			"s": {Messages: committedWeatherHistory(), URL: "https://gemini.google.com/app/OLD"},
@@ -1398,5 +1440,114 @@ func TestSessionStateInspector(t *testing.T) {
 	body = decode(t, get(newH(map[string]*session{"s": {Pending: true}}), "s", "GET"))
 	if body["state"] != "pending_unbound" {
 		t.Fatalf("unbound pending misreported: %v", body)
+	}
+}
+
+func chunkedHandler(fake *fakeRecoveryBackend) *handler {
+	h := &handler{model: "gemini-web", client: fake, maxChars: 3000, gate: make(chan struct{}, 1),
+		sessions: map[string]*session{}}
+	h.gate <- struct{}{}
+	return h
+}
+
+func ackAnswerFor(prompt string) string {
+	if strings.Contains(prompt, "HISTORY IMPORT") {
+		return "ACK"
+	}
+	return "all good"
+}
+
+func TestChunkedReplaySplitsHistoryAndKeepsOneFinal(t *testing.T) {
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
+	fake.answerFor = ackAnswerFor
+	h := chunkedHandler(fake)
+	msgs := []message{
+		{Role: "user", Content: "Q1 " + strings.Repeat("a", 1200)},
+		{Role: "assistant", Content: "A1 " + strings.Repeat("b", 1200)},
+		{Role: "user", Content: "Q2 " + strings.Repeat("c", 1200)},
+		{Role: "assistant", Content: "A2 " + strings.Repeat("d", 1200)},
+		{Role: "user", Content: "final question"},
+	}
+	w := postJSON(t, h, "chunk1", chatRequest{Model: "gemini-web", Messages: msgs})
+	if w.Code != http.StatusOK {
+		t.Fatalf("chunked replay: %d %s", w.Code, w.Body.String())
+	}
+	if fake.asks != 3 {
+		t.Fatalf("history must arrive as 2 imports plus final, got %d asks", fake.asks)
+	}
+	if len(fake.freshFlags) != 3 || !fake.freshFlags[0] || fake.freshFlags[1] || fake.freshFlags[2] {
+		t.Fatalf("only the first turn starts a chat: %v", fake.freshFlags)
+	}
+	for i, p := range fake.prompts {
+		if len(p) > 3000 {
+			t.Fatalf("turn %d exceeds the paste ceiling: %d bytes", i+1, len(p))
+		}
+	}
+	if !strings.Contains(fake.prompts[2], "final question") {
+		t.Fatal("final turn must carry the question")
+	}
+	sess := h.sessions["chunk1"]
+	if sess == nil || len(sess.Messages) != len(msgs) || sess.URL == "" {
+		t.Fatalf("transcript not committed: %+v", sess)
+	}
+}
+
+func TestChunkedReplayRejectsNonAckImport(t *testing.T) {
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") {
+			return "here is a whole essay instead"
+		}
+		return "all good"
+	}
+	h := chunkedHandler(fake)
+	msgs := []message{
+		{Role: "user", Content: "Q1 " + strings.Repeat("a", 1200)},
+		{Role: "assistant", Content: "A1 " + strings.Repeat("b", 1200)},
+		{Role: "user", Content: "final question"},
+	}
+	w := postJSON(t, h, "chunk2", chatRequest{Model: "gemini-web", Messages: msgs})
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("non-ACK import must fail closed: %d %s", w.Code, w.Body.String())
+	}
+	if !h.sessions["chunk2"].Pending {
+		t.Fatal("refused import must keep the pending binding")
+	}
+}
+
+func TestChunkedReplayAcceptsEmptyImport(t *testing.T) {
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") {
+			return ""
+		}
+		return "all good"
+	}
+	h := chunkedHandler(fake)
+	msgs := []message{
+		{Role: "user", Content: "Q1 " + strings.Repeat("a", 1200)},
+		{Role: "assistant", Content: "A1 " + strings.Repeat("b", 1200)},
+		{Role: "user", Content: "final question"},
+	}
+	w := postJSON(t, h, "chunk3", chatRequest{Model: "gemini-web", Messages: msgs})
+	if w.Code != http.StatusOK {
+		t.Fatalf("empty import acknowledgement must not wedge: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSingleOversizeQuestionRefusedNotSplit(t *testing.T) {
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW"}
+	fake.answerFor = ackAnswerFor
+	h := chunkedHandler(fake)
+	msgs := []message{{Role: "user", Content: strings.Repeat("q", 5000)}}
+	w := postJSON(t, h, "chunk4", chatRequest{Model: "gemini-web", Messages: msgs})
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize single question must be refused: %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "will not split") {
+		t.Fatalf("refusal must name the no-split rule: %s", w.Body.String())
+	}
+	if fake.asks != 0 {
+		t.Fatalf("refused question must never reach the browser: %d asks", fake.asks)
 	}
 }

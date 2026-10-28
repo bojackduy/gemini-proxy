@@ -9,8 +9,9 @@
 // Stateful thread architecture (thread = context): Gemini's server keeps the
 // conversation. Continuation sends only new messages (delta) when the incoming
 // history extends the stored canonical prefix; divergent history starts a new
-// chat and replays the history as one bounded turn (per-turn cap -max-chars;
-// chunked multi-turn replay is a Phase-2 gap — see README/report).
+// chat and replays the history as bounded turns (per-turn cap -max-chars,
+// single-submission ceiling -max-paste-bytes): history as inert ACK imports,
+// then one final answer-seeking turn.
 package main
 
 import (
@@ -50,6 +51,7 @@ func run() error {
 	background := flag.Bool("background", false, "minimize Chrome")
 	model := flag.String("model", "gemini-web", "model ID")
 	maxChars := flag.Int("max-chars", 200000, "maximum bytes per Gemini turn")
+	maxPaste := flag.Int("max-paste-bytes", 0, "maximum bytes one submission may carry; above this the bridge refuses before sending anything (0 disables, per-turn budget alone applies)")
 	maxImages := flag.Int("max-images", gemini.MaxResponseImages, "maximum output images carried as image_url parts per turn")
 	maxImageBytes := flag.Int("max-image-bytes", gemini.MaxResponseImageBytes, "maximum decoded bytes accepted per output image")
 	state := flag.String("state", filepath.Join(defaultProfile(), "openai-sessions.json"), "persistent session state")
@@ -64,7 +66,7 @@ func run() error {
 	cg := gemini.New(*port, *profile, *chrome)
 	cg.Background = *background
 	defer cg.Close()
-	h := &handler{client: cg, model: *model, maxChars: *maxChars, statePath: *state, profileDir: *profile, gate: make(chan struct{}, 1)}
+	h := &handler{client: cg, model: *model, maxChars: *maxChars, maxPaste: *maxPaste, statePath: *state, profileDir: *profile, gate: make(chan struct{}, 1)}
 	h.gate <- struct{}{}
 	if err := h.load(); err != nil {
 		return err
@@ -254,6 +256,7 @@ type handler struct {
 	client     browserClient
 	model      string
 	maxChars   int
+	maxPaste   int
 	statePath  string
 	profileDir string
 
@@ -747,9 +750,11 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// Delta vs fresh: incoming history extending the stored prefix sends
 	// only the suffix; anything else starts a new chat and replays the
-	// history as one bounded turn. A reseed plan skips delta: the stored
+	// history as bounded turns. A reseed plan skips delta: the stored
 	// prefix belongs to the abandoned thread.
-	var toSend string
+	var seedMsgs []message
+	var recordMsgs []message
+	var sysHead string
 	fresh := true
 	if reseedPlan == nil && h.hasActive && h.activeSID == sid && len(sess.Messages) > 0 && len(req.Messages) >= len(sess.Messages) {
 		match := true
@@ -761,19 +766,14 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if match {
 			fresh = false
-			var b strings.Builder
 			if teach := h.teachReminder(req, sess); teach != "" {
-				b.WriteString(teach + "\n\n")
+				sysHead = teach + "\n\n"
 			}
-			for _, m := range req.Messages[len(sess.Messages):] {
-				b.WriteString(formatForBrowser(m) + "\n")
-			}
-			toSend = b.String()
+			seedMsgs = req.Messages[len(sess.Messages):]
 		}
 	}
 	if fresh {
-		var b strings.Builder
-		sysHead := ""
+		sysHead = ""
 		if sys := systemPrompt(req.Tools, choice); sys != "" {
 			sysHead = sys + "\n\n"
 		}
@@ -798,29 +798,49 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if reseedPlan != nil {
-			toSend = buildReseedSeed(sysHead, req.Messages, reseedPlan)
-		} else {
-			b.WriteString(sysHead)
-			for _, m := range req.Messages {
-				b.WriteString(formatForBrowser(m) + "\n")
-			}
-			toSend = b.String()
+			recordMsgs = reseedPlan.carried
 		}
-		if len(toSend) > h.maxChars {
+		seedMsgs = req.Messages
+	}
+	// Chunk into bounded turns: carried record first (inert ACK imports),
+	// then history imports plus one final answer-seeking turn. Single-turn
+	// assembly is byte-identical to the legacy one-paste path.
+	limit := h.pasteLimit()
+	recordTurns := h.buildGeminiRecordTurns(recordMsgs, limit)
+	turns, terr := h.buildGeminiTurns(sysHead, seedMsgs, limit)
+	if terr != nil {
+		h.mu.Unlock()
+		h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", terr.Error())
+		return
+	}
+	allTurns := append(recordTurns, turns...)
+	seedBase := 0
+	if !fresh {
+		seedBase = len(sess.Messages)
+	}
+	// One choke point: every turn obeys the paste ceiling before anything
+	// is journaled or submitted.
+	sizes := make([]int, len(allTurns))
+	replays := make([]bool, len(allTurns))
+	for i, t := range allTurns {
+		sizes[i], replays[i] = len(t.prompt), t.replay
+		if len(t.prompt) > limit && limit > 0 {
 			h.mu.Unlock()
 			h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
-				fmt.Sprintf("turn bytes %d exceed per-turn budget %d; history replay chunking is Phase 2", len(toSend), h.maxChars))
+				fmt.Sprintf("turn %d/%d needs a %d-byte paste over the %d-byte single-paste limit. Nothing was sent and no tool was run.", i+1, len(allTurns), len(t.prompt), limit))
 			return
 		}
 	}
-	canonical := append([]message{}, req.Messages...)
-	if len(toSend) > h.maxChars {
+	log.Printf("[openai] session=%s plan turns=%d sizes=%v replay=%v paste_limit=%d", shortSID(sid), len(allTurns), sizes, replays, limit)
+	if len(allTurns) == 0 {
 		h.mu.Unlock()
-		h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "turn exceeds per-turn budget")
+		h.writeError(w, http.StatusBadRequest, "invalid_request_error", "no submission turns")
 		return
 	}
+	canonical := append([]message{}, req.Messages...)
+	finalPrompt := allTurns[len(allTurns)-1].prompt
 	sess.Pending = true
-	sess.PendingPrompt = toSend
+	sess.PendingPrompt = finalPrompt
 	sess.PendingMessages = canonical
 	sess.PendingTools = req.Tools
 	sess.PendingChoice = req.ToolChoice
@@ -836,53 +856,89 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if preURL != "" {
 		sess.URL = preURL
 	}
-	// Single-turn submit path: one prompt per Ask (chunk 1 of 1).
-	// Over-budget turns are rejected with 413 above, never split.
-	h.appendSent(sentEntry{Event: "submitted", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1})
+	for i, t := range allTurns {
+		h.appendSent(sentEntry{Event: "submitted", Session: sid, URL: sess.URL, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(allTurns)})
+	}
 	h.saveLocked()
 	h.mu.Unlock()
 
 	started := time.Now()
 	fid := gemini.NewFlowID()
-	log.Printf("[gemini-flow] id=%s session=%s stage=request fresh=%v prompt_bytes=%d tools=%d stream=%v", fid, shortSID(sid), fresh, len(toSend), len(req.Tools), req.Stream)
-	log.Printf("[openai] session=%s stage=browser-start fresh=%v prompt_bytes=%d tools=%d", shortSID(sid), fresh, len(toSend), len(req.Tools))
-	answer, images, err := h.askTurn(gemini.WithFlowID(gemini.WithTurnIdentity(r.Context(), sid+"\x00"+hash), fid), toSend, fresh)
-	if err != nil {
-		log.Printf("[gemini-flow] id=%s session=%s stage=browser_result result=error duration=%s not_submitted=%v err=%v", fid, shortSID(sid), time.Since(started).Round(time.Millisecond), errors.Is(err, gemini.ErrNotSubmitted), err)
-		log.Printf("[openai] session=%s stage=browser-failed duration=%s not_submitted=%v", shortSID(sid), time.Since(started).Round(time.Millisecond), errors.Is(err, gemini.ErrNotSubmitted))
-		if errors.Is(err, gemini.ErrNotLoggedIn) || gemini.IsPreSubmit(err) || errors.Is(err, gemini.ErrNoComposer) || gemini.IsNavigateError(err) {
-			h.mu.Lock()
-			clearPendingBinding(sess)
-			h.appendSent(sentEntry{Event: "failed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1})
-			h.saveLocked()
-			h.mu.Unlock()
-		} else {
-			// Uncertain outcome: the submission may have reached the
-			// thread. PendingPrompt is kept for hash-lineage diagnosis.
-			h.mu.Lock()
-			h.appendSent(sentEntry{Event: "interrupted", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1})
-			h.saveLocked()
-			h.mu.Unlock()
-		}
-		if errors.Is(err, gemini.ErrNotLoggedIn) {
-			h.writeError(w, http.StatusUnauthorized, "authentication_error", "not logged in to gemini.google.com — run gemini-proxy -wait-login")
-			return
-		}
-		if errors.Is(err, gemini.ErrForeignDraft) || errors.Is(err, gemini.ErrDraftOwned) {
-			// Nothing was typed over and nothing was sent, so retrying the same
-			// request would only refuse again. The person gets the outcome and
-			// the one thing they can do instead of a selector diagnostic.
-			unknown := "This chat box holds text this bridge cannot verify it wrote, so it was left untouched."
-			next := "Nothing from your previous message was resent. Next: open the dedicated Gemini Web Chrome window and keep or clear that text yourself before sending your message again."
-			if errors.Is(err, gemini.ErrDraftOwned) {
-				unknown = "This chat box still holds a message from an attempt that may already have been sent, so it was left untouched."
-				next = "Do not resend it. Nothing from your previous message was resent and no tools were re-run. Next: open the dedicated Gemini Web Chrome window and read that conversation for the answer; clearing the chat box is a separate manual step there."
+	var answer string
+	var images []gemini.ResponseImage
+	for i, t := range allTurns {
+		turnFresh := fresh && i == 0
+		log.Printf("[gemini-flow] id=%s session=%s stage=request turn=%d/%d replay=%v fresh=%v prompt_bytes=%d tools=%d stream=%v", fid, shortSID(sid), i+1, len(allTurns), t.replay, turnFresh, len(t.prompt), len(req.Tools), req.Stream)
+		log.Printf("[openai] session=%s stage=browser-start turn=%d/%d fresh=%v prompt_bytes=%d tools=%d", shortSID(sid), i+1, len(allTurns), turnFresh, len(t.prompt), len(req.Tools))
+		var turnImages []gemini.ResponseImage
+		var terr error
+		answer, turnImages, terr = h.askTurn(gemini.WithFlowID(gemini.WithTurnIdentity(r.Context(), sid+"\x00"+hash), fid), t.prompt, turnFresh)
+		if terr != nil {
+			log.Printf("[gemini-flow] id=%s session=%s stage=browser_result turn=%d/%d result=error duration=%s not_submitted=%v err=%v", fid, shortSID(sid), i+1, len(allTurns), time.Since(started).Round(time.Millisecond), errors.Is(terr, gemini.ErrNotSubmitted), terr)
+			log.Printf("[openai] session=%s stage=browser-failed turn=%d/%d duration=%s not_submitted=%v", shortSID(sid), i+1, len(allTurns), time.Since(started).Round(time.Millisecond), errors.Is(terr, gemini.ErrNotSubmitted))
+			err = terr
+			if errors.Is(err, gemini.ErrNotLoggedIn) || gemini.IsPreSubmit(err) || errors.Is(err, gemini.ErrNoComposer) || gemini.IsNavigateError(err) {
+				h.mu.Lock()
+				clearPendingBinding(sess)
+				h.appendSent(sentEntry{Event: "failed", Session: sid, URL: sess.URL, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(allTurns)})
+				h.saveLocked()
+				h.mu.Unlock()
+			} else {
+				// Uncertain outcome: the submission may have reached the
+				// thread. PendingPrompt is kept for hash-lineage diagnosis.
+				h.mu.Lock()
+				h.appendSent(sentEntry{Event: "interrupted", Session: sid, URL: sess.URL, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(allTurns)})
+				h.saveLocked()
+				h.mu.Unlock()
 			}
-			h.writeError(w, http.StatusUnprocessableEntity, "invalid_request_error", unknown+" "+next)
+			if errors.Is(err, gemini.ErrNotLoggedIn) {
+				h.writeError(w, http.StatusUnauthorized, "authentication_error", "not logged in to gemini.google.com — run gemini-proxy -wait-login")
+				return
+			}
+			if errors.Is(err, gemini.ErrForeignDraft) || errors.Is(err, gemini.ErrDraftOwned) {
+				// Nothing was typed over and nothing was sent, so retrying the same
+				// request would only refuse again. The person gets the outcome and
+				// the one thing they can do instead of a selector diagnostic.
+				unknown := "This chat box holds text this bridge cannot verify it wrote, so it was left untouched."
+				next := "Nothing from your previous message was resent. Next: open the dedicated Gemini Web Chrome window and keep or clear that text yourself before sending your message again."
+				if errors.Is(err, gemini.ErrDraftOwned) {
+					unknown = "This chat box still holds a message from an attempt that may already have been sent, so it was left untouched."
+					next = "Do not resend it. Nothing from your previous message was resent and no tools were re-run. Next: open the dedicated Gemini Web Chrome window and read that conversation for the answer; clearing the chat box is a separate manual step there."
+				}
+				h.writeError(w, http.StatusUnprocessableEntity, "invalid_request_error", unknown+" "+next)
+				return
+			}
+			h.writeError(w, http.StatusBadGateway, "server_error", "BACKEND FAILURE: "+err.Error())
 			return
 		}
-		h.writeError(w, http.StatusBadGateway, "server_error", "BACKEND FAILURE: "+err.Error())
-		return
+		if t.replay {
+			// History imports are inert: the model must acknowledge without
+			// tool calls. An empty acknowledgement is accepted (the import
+			// is the user message, which reached the thread before
+			// generation); anything else fails closed without executing.
+			if got := strings.TrimSpace(answer); got != "ACK" && got != "" {
+				log.Printf("[gemini-flow] id=%s session=%s stage=replay turn=%d/%d result=unexpected-answer", fid, shortSID(sid), i+1, len(allTurns))
+				h.mu.Lock()
+				h.appendSent(sentEntry{Event: "interrupted", Session: sid, URL: sess.URL, PromptHash: promptHash(t.prompt), Bytes: len(t.prompt), Chunk: i + 1, Chunks: len(allTurns), Note: "history import did not acknowledge with ACK; session remains uncertain"})
+				h.saveLocked()
+				h.mu.Unlock()
+				h.writeError(w, http.StatusBadGateway, "server_error", "BACKEND FAILURE: history import did not acknowledge with ACK; session remains uncertain")
+				return
+			}
+			if got := strings.TrimSpace(answer); got == "" {
+				log.Printf("[gemini-flow] id=%s session=%s stage=replay turn=%d/%d result=imported-without-answer", fid, shortSID(sid), i+1, len(allTurns))
+			} else {
+				log.Printf("[gemini-flow] id=%s session=%s stage=replay turn=%d/%d result=acked", fid, shortSID(sid), i+1, len(allTurns))
+			}
+			if t.synced > 0 {
+				h.mu.Lock()
+				sess.Messages = append([]message{}, req.Messages[:seedBase+t.synced]...)
+				h.saveLocked()
+				h.mu.Unlock()
+			}
+			continue
+		}
+		images = turnImages
 	}
 
 	// Validate the protocol BEFORE emitting anything (buffered SSE).
@@ -895,7 +951,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// protocol validation: no calls are delivered. The outcome is
 		// recorded; the Dirty lifecycle is unchanged (a later recovery
 		// batch owns it).
-		h.appendSent(sentEntry{Event: "completed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1, AnswerHash: gemini.AnswerHash(answer), Note: "answer rejected by tool-protocol validation; no calls delivered"})
+		h.appendSent(sentEntry{Event: "completed", Session: sid, URL: sess.URL, PromptHash: promptHash(finalPrompt), Bytes: len(finalPrompt), Chunk: 1, Chunks: 1, AnswerHash: gemini.AnswerHash(answer), Note: "answer rejected by tool-protocol validation; no calls delivered"})
 		diag := h.sentDiagnosis(sid, sess)
 		h.saveLocked()
 		h.mu.Unlock()
@@ -923,14 +979,14 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if postURL := h.currentThreadURL(r.Context()); postURL != "" {
 		sess.URL = postURL
 	}
-	h.appendSent(sentEntry{Event: "completed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Chunk: 1, Chunks: 1, AnswerHash: gemini.AnswerHash(answer)})
+	h.appendSent(sentEntry{Event: "completed", Session: sid, URL: sess.URL, PromptHash: promptHash(finalPrompt), Bytes: len(finalPrompt), Chunk: 1, Chunks: 1, AnswerHash: gemini.AnswerHash(answer)})
 	if reseedPlan != nil {
 		// The commit records the linkage: abandoned thread, rewrite
 		// classification, and carried/dropped lists — in the journal
 		// and the sent-log, so both survive adapter restart.
 		sess.ReseedFrom = reseedPlan.oldURL
-		sess.ReseedEvidence = reseedPlan.evidence(sess.URL, len(toSend))
-		h.appendSent(sentEntry{Event: "reseed", Session: sid, URL: sess.URL, PromptHash: promptHash(toSend), Bytes: len(toSend), Note: reseedPlan.note(sess.URL)})
+		sess.ReseedEvidence = reseedPlan.evidence(sess.URL, len(finalPrompt))
+		h.appendSent(sentEntry{Event: "reseed", Session: sid, URL: sess.URL, PromptHash: promptHash(finalPrompt), Bytes: len(finalPrompt), Note: reseedPlan.note(sess.URL)})
 		log.Printf("[openai] session=%s rewrite-reseed committed %s", shortSID(sid), sess.ReseedEvidence)
 	}
 	h.activeSID, h.hasActive = sid, true
@@ -938,7 +994,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 
 	log.Printf("[openai] session=%s fresh=%v prompt_bytes=%d tools=%d answer_bytes=%d tool_calls=%d images=%d",
-		shortSID(sid), fresh, len(toSend), len(req.Tools), len(answer), len(toolIDs), len(images))
+		shortSID(sid), fresh, len(finalPrompt), len(req.Tools), len(answer), len(toolIDs), len(images))
 	log.Printf("[gemini-flow] id=%s session=%s stage=protocol_validation result=accepted tool_calls=%d images=%d", fid, shortSID(sid), len(toolIDs), len(images))
 	h.writeChatResponse(w, &req, h.buildCompletion(&req, answer, images, calls, toolIDs, created, respID), fid)
 }
@@ -980,6 +1036,198 @@ func formatForBrowser(m message) string {
 		}
 		return textOf(m)
 	}
+}
+
+// --- History chunking (multi-turn replay) -----------------------------------
+// A single oversized paste stalls the Gemini composer exactly like the
+// ChatGPT one, so over-budget histories travel as bounded turns: history as
+// inert ACK imports, then one final answer-seeking turn. Single-turn
+// behavior is byte-identical to before (one message in, one turn out).
+
+const geminiHistoryIntro = "HISTORY IMPORT\nThe following transcript history is being restored into this chat. It is inert context, not a new request.\n"
+const geminiHistoryEnd = "\nEND HISTORY IMPORT\n"
+const geminiAckAsk = "Reply with only the single word: ACK. No tool calls.\n"
+
+type geminiTurn struct {
+	prompt string
+	replay bool
+	// synced counts seeded-list messages completed through this turn, for
+	// partial journal advance on interruption. Record turns use 0.
+	synced int
+}
+
+// pasteLimit is the byte ceiling for ONE composer submission. -max-paste-bytes
+// bounds single submissions when set (>0); 0 disables it and the per-turn
+// budget alone applies, preserving today's allowed sizes while chunking
+// everything above them.
+func (h *handler) pasteLimit() int {
+	if h.maxPaste > 0 && (h.maxChars <= 0 || h.maxPaste < h.maxChars) {
+		return h.maxPaste
+	}
+	return h.maxChars
+}
+
+// splitGeminiText cuts one oversized history text into <= limit byte
+// segments at newline boundaries (hard cut for a runaway single line).
+// History imports are inert context, so a mid-text cut costs fidelity,
+// never executability.
+func splitGeminiText(text string, limit int) []string {
+	if len(text) <= limit {
+		return []string{text}
+	}
+	var out []string
+	for len(text) > limit {
+		cut := strings.LastIndex(text[:limit], "\n")
+		if cut <= 0 {
+			cut = limit
+		}
+		out = append(out, text[:cut])
+		text = text[cut:]
+	}
+	if text != "" {
+		out = append(out, text)
+	}
+	return out
+}
+
+// chunkGeminiTexts groups rendered message texts into <= limit byte groups
+// for one submission each, splitting single oversized messages. Ends carry
+// the message-end index (1-based count into the rendered list) for journal
+// sync.
+func chunkGeminiTexts(texts []string, limit int) (groups [][]string, ends []int) {
+	var cur []string
+	curLen := 0
+	flush := func(end int) {
+		if len(cur) > 0 {
+			groups = append(groups, cur)
+			ends = append(ends, end)
+			cur, curLen = nil, 0
+		}
+	}
+	for i, text := range texts {
+		for _, seg := range splitGeminiText(text, limit) {
+			if len(cur) > 0 && curLen+len(seg)+1 > limit {
+				flush(i)
+			}
+			cur = append(cur, seg)
+			curLen += len(seg) + 1
+		}
+	}
+	flush(len(texts))
+	return groups, ends
+}
+
+// buildGeminiTurns splits a message list into bounded submissions: history
+// (through the last completed assistant exchange) travels as inert ACK
+// imports, the remainder asks once as the final turn carrying sysHead. A
+// single over-budget question is refused, never split: an interruption
+// would strand half a request with no answer that belongs to it.
+func (h *handler) buildGeminiTurns(sysHead string, msgs []message, limit int) ([]geminiTurn, error) {
+	texts := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		texts = append(texts, formatForBrowser(m)+"\n")
+	}
+	// Everything through the last completed assistant exchange is history.
+	// The remaining user/tool messages are the currently unanswered request.
+	cut := 0
+	for i, m := range msgs {
+		if m.Role == "assistant" && len(m.ToolCalls) == 0 {
+			cut = i + 1
+		}
+	}
+	// Also support supplied transcripts with consecutive user messages.
+	for i, m := range msgs {
+		if m.Role == "user" && i > cut {
+			for _, earlier := range msgs[:i] {
+				if earlier.Role == "user" {
+					cut = i
+					break
+				}
+			}
+		}
+	}
+	overhead := len(geminiHistoryIntro) + len(geminiHistoryEnd) + len(geminiAckAsk)
+	pack := limit
+	if pack > 0 {
+		pack = limit - overhead
+		if pack < 1 {
+			pack = 1
+		}
+	}
+	var turns []geminiTurn
+	if cut > 0 {
+		groups, ends := chunkGeminiTexts(texts[:cut], pack)
+		for gi, g := range groups {
+			var b strings.Builder
+			b.WriteString(geminiHistoryIntro)
+			for _, seg := range g {
+				b.WriteString(seg + "\n")
+			}
+			b.WriteString(geminiHistoryEnd + geminiAckAsk)
+			turns = append(turns, geminiTurn{prompt: b.String(), replay: true, synced: ends[gi]})
+		}
+	}
+	current := texts[cut:]
+	if limit > 0 {
+		for _, text := range current {
+			if len(text)+1 > limit {
+				return nil, fmt.Errorf("one message is %d bytes, over the %d-byte per-turn budget. The bridge will not split a single message across submissions, because an interruption cannot be recovered. Nothing was sent and no tool was run; shorten the message or raise -max-chars", len(text), limit)
+			}
+		}
+	}
+	groups, ends := chunkGeminiTexts(current, pack)
+	for i, g := range groups {
+		last := i == len(groups)-1
+		var b strings.Builder
+		if last {
+			b.WriteString(sysHead)
+		} else {
+			b.WriteString(geminiHistoryIntro)
+		}
+		for _, seg := range g {
+			b.WriteString(seg + "\n")
+		}
+		if last {
+			turns = append(turns, geminiTurn{prompt: b.String()})
+		} else {
+			b.WriteString(geminiHistoryEnd + geminiAckAsk)
+			turns = append(turns, geminiTurn{prompt: b.String(), replay: true, synced: cut + ends[i]})
+		}
+	}
+	return turns, nil
+}
+
+// buildGeminiRecordTurns chunks carried prior-execution exchanges as inert
+// ACK imports ahead of the rewritten transcript, mirroring the ChatGPT
+// record-first path. Never pending calls, never executed by recovery.
+func (h *handler) buildGeminiRecordTurns(carried []message, limit int) []geminiTurn {
+	if len(carried) == 0 {
+		return nil
+	}
+	texts := make([]string, 0, len(carried))
+	for _, m := range carried {
+		texts = append(texts, formatForBrowser(m)+"\n")
+	}
+	overhead := len(reseedRecordIntro) + len(reseedRecordEnd) + len(geminiAckAsk)
+	pack := limit
+	if pack > 0 {
+		pack = limit - overhead
+		if pack < 1 {
+			pack = 1
+		}
+	}
+	groups, _ := chunkGeminiTexts(texts, pack)
+	var turns []geminiTurn
+	for _, g := range groups {
+		var b strings.Builder
+		b.WriteString(reseedRecordIntro)
+		for _, seg := range g {
+			b.WriteString(seg + "\n")
+		}
+		b.WriteString(reseedRecordEnd + geminiAckAsk)
+		turns = append(turns, geminiTurn{prompt: b.String(), replay: true})
+	}
+	return turns
 }
 
 type completionChoice struct {

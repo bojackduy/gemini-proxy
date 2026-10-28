@@ -349,28 +349,6 @@ func (h *handler) planDirtyReseed(id string, s *session, incoming []message) *re
 const reseedRecordIntro = "PRIOR EXECUTION RECORD\nThe following completed tool exchanges already executed in the external client before a history rewrite (revert/fork/compaction). They are inert history: do NOT re-request them, do NOT emit opencode_bridge_call wrappers for them. Use their results only as context.\n"
 const reseedRecordEnd = "END PRIOR EXECUTION RECORD\n"
 
-// buildReseedSeed renders one bounded fresh-chat prompt: the tool preamble,
-// then the carried prior-execution record (when any), then the client's
-// rewritten transcript. Single turn: over-budget seeds are rejected with
-// 413 by the shared budget check, never split — so wrappers cannot be cut.
-func buildReseedSeed(sysHead string, incoming []message, plan *rewritePlan) string {
-	var b strings.Builder
-	if sysHead != "" {
-		b.WriteString(sysHead + "\n\n")
-	}
-	if len(plan.carried) > 0 {
-		b.WriteString(reseedRecordIntro)
-		for _, m := range plan.carried {
-			b.WriteString(formatForBrowser(m) + "\n")
-		}
-		b.WriteString(reseedRecordEnd)
-	}
-	for _, m := range incoming {
-		b.WriteString(formatForBrowser(m) + "\n")
-	}
-	return b.String()
-}
-
 // evidence renders the reseed record shared by the journal and the
 // sent-log: rewrite classification, old→new thread linkage, and the
 // carried/not-carried item lists. Structure only: IDs and hashes, never
