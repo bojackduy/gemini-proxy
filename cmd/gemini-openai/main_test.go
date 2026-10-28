@@ -2120,3 +2120,74 @@ func TestDeltaPerformsNoToolReplay(t *testing.T) {
 }
 
 func geminiHomePage() string { return "https://gemini.google.com/app" }
+
+func TestSystemOnlyDivergenceContinuesDelta(t *testing.T) {
+	// Live shape: regenerated 172KB system prompt (tool-set flip 0->12)
+	// over an untouched 2-message conversation. Must continue on the
+	// bound thread with the new tool names reminded — not reseed.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/THREAD"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fine"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions: map[string]*session{"sys": {Messages: []message{
+			{Role: "system", Content: "trimmed instructions"},
+			{Role: "user", Content: "hi"},
+			{Role: "assistant", Content: "hello"},
+		}, ToolsFP: toolsFingerprint(nil), URL: "https://gemini.google.com/app/THREAD"}}}
+	h.gate <- struct{}{}
+	incoming := []message{
+		{Role: "system", Content: "full instructions " + strings.Repeat("s", 5000)},
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "hello"},
+		{Role: "user", Content: "what tool can you use?"},
+	}
+	req := chatRequest{Model: "gemini-web", Messages: incoming, Tools: weatherTools()}
+	w := postJSON(t, h, "sys", req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("system-only divergence must continue delta: %d %s", w.Code, w.Body.String())
+	}
+	if fake.asks != 1 || len(fake.freshFlags) != 1 || fake.freshFlags[0] {
+		t.Fatalf("one delta submit on the bound thread: asks=%d fresh=%v", fake.asks, fake.freshFlags)
+	}
+	if !strings.Contains(fake.prompts[0], "get_weather") || !strings.Contains(fake.prompts[0], "what tool can you use?") {
+		t.Fatalf("final must remind new tools and carry the question: %q", fake.prompts[0][:200])
+	}
+	if got := h.sessions["sys"].URL; got != "https://gemini.google.com/app/THREAD" {
+		t.Fatalf("thread moved: %s", got)
+	}
+}
+
+func TestSystemPlusUserDivergenceReseeds(t *testing.T) {
+	// System change AND a rewritten user message: not system-only, must
+	// reseed fresh rather than silently continue.
+	fake := &fakeRecoveryBackend{urlNow: "https://gemini.google.com/app/NEW3", mintURL: "https://gemini.google.com/app/NEW3"}
+	fake.answerFor = func(prompt string) string {
+		if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+			return "ACK"
+		}
+		return "fine"
+	}
+	h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(t.TempDir(), "state.json"),
+		sessions: map[string]*session{"sys2": {Messages: []message{
+			{Role: "system", Content: "trimmed instructions"},
+			{Role: "user", Content: "hi"},
+		}, URL: "https://gemini.google.com/app/THREAD"}}}
+	h.gate <- struct{}{}
+	incoming := []message{
+		{Role: "system", Content: "full instructions " + strings.Repeat("s", 5000)},
+		{Role: "user", Content: "something else entirely"},
+	}
+	w := postJSON(t, h, "sys2", chatRequest{Model: "gemini-web", Messages: incoming})
+	if w.Code != http.StatusOK {
+		t.Fatalf("system+user divergence: %d %s", w.Code, w.Body.String())
+	}
+	if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+		t.Fatalf("non-system divergence must start a new chat: fresh=%v", fake.freshFlags)
+	}
+}

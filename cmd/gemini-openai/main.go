@@ -149,6 +149,11 @@ type session struct {
 	// URL is the owned Gemini chat/thread URL submissions went to. It
 	// ties sent-log entries and future recovery reads to the thread.
 	URL string `json:"url,omitempty"`
+	// ToolsFP fingerprints the tool set whose schemas were last taught to
+	// this thread. A regenerated system prompt with a CHANGED tool set is
+	// mechanical client regen (delta-continue with a reminder); the same
+	// tools with a rewritten system is an authored rewrite (reseed).
+	ToolsFP string `json:"tools_fp,omitempty"`
 	// PendingPrompt is the exact prompt bytes of the uncertain
 	// submission. Its promptHash is the lineage key the sent-log
 	// diagnosis and any future adoption comparison use.
@@ -514,6 +519,15 @@ func reqHash(req *chatRequest) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// toolsFingerprint identifies a tool set for change detection: a
+// regenerated system prompt with a different fingerprint is mechanical
+// client regen, not an authored rewrite.
+func toolsFingerprint(tools []toolDef) string {
+	raw, _ := json.Marshal(tools)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
 func textOf(m message) string {
 	switch c := m.Content.(type) {
 	case string:
@@ -812,7 +826,8 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var sysHead string
 	fresh := true
 	// Delta when the incoming history extends the stored prefix EXACTLY,
-	// plus one narrow exception: assistant echo bloat. The client
+	// plus two narrow exceptions: assistant echo bloat, and regenerated
+	// system prompts. The client
 	// re-echoes our just-committed answers with appended re-render notes
 	// (live: ~637B pure appends); treating that as a rewrite reseeds a
 	// new chat every turn. echoBloatSkipped absorbs assistant-only appends
@@ -826,7 +841,30 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// with a valid saved URL attempts the delta; if the tab cannot be
 	// restored to that URL the submit fails closed — never a silent new
 	// chat.
+	deltaKind := ""
 	if reseedPlan == nil && len(sess.Messages) > 0 && firstMismatch(req.Messages, sess.Messages) == nil {
+		deltaKind = "exact"
+	} else if reseedPlan == nil && len(sess.Messages) > 0 {
+		if ok, skipped := echoBloatSkipped(sess.Messages, req.Messages, 1024); ok {
+			if skipped > 0 {
+				log.Printf("[openai] session=%s tolerant-prefix skipped=%dB echo-bloat absorbed", shortSID(sid), skipped)
+			}
+			deltaKind = "echo"
+		} else if systemOnlyDivergence(sess.Messages, req.Messages) && sess.ToolsFP != "" && toolsFingerprint(req.Tools) != sess.ToolsFP {
+			// Regenerated system prompt over untouched conversation AND a
+			// changed tool set versus the RECORDED one: mechanical client
+			// regen (the tool catalog regenerates the whole system
+			// message), not an authored rewrite — the thread keeps
+			// operating under its stored instructions while the
+			// recomputed reminder below teaches the new tool names. An
+			// unrecorded tool set (legacy journal) or identical tools
+			// with a rewritten system stays a reseed: those combinations
+			// are authored rewrites or unknowns, never assumed mechanical.
+			log.Printf("[openai] session=%s system-prompt regenerated tools-changed; continuing delta under stored instructions", shortSID(sid))
+			deltaKind = "system"
+		}
+	}
+	if deltaKind != "" {
 		if gemini.ValidThreadURL(sess.URL) {
 			fresh = false
 			if teach := h.teachReminder(req, sess); teach != "" {
@@ -836,20 +874,6 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Printf("[openai] session=%s delta-refused reason=missing-or-invalid-target incoming_messages=%d saved_messages=%d",
 				shortSID(sid), len(req.Messages), len(sess.Messages))
-		}
-	} else if reseedPlan == nil && len(sess.Messages) > 0 {
-		if ok, skipped := echoBloatSkipped(sess.Messages, req.Messages, 1024); ok {
-			if gemini.ValidThreadURL(sess.URL) {
-				log.Printf("[openai] session=%s tolerant-prefix skipped=%dB echo-bloat absorbed", shortSID(sid), skipped)
-				fresh = false
-				if teach := h.teachReminder(req, sess); teach != "" {
-					sysHead = teach + "\n\n"
-				}
-				seedMsgs = req.Messages[len(sess.Messages):]
-			} else {
-				log.Printf("[openai] session=%s delta-refused reason=missing-or-invalid-target incoming_messages=%d saved_messages=%d",
-					shortSID(sid), len(req.Messages), len(sess.Messages))
-			}
 		}
 	}
 	if fresh {
@@ -1103,6 +1127,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// read-back path): otherwise every next turn re-imports the previous
 	// answer as history on the thread that already holds it.
 	sess.Messages = append(canonical, message{Role: "assistant", Content: assistantContent(answer, images), ToolCalls: h.rebuildToolCalls(calls, toolIDs)})
+	sess.ToolsFP = toolsFingerprint(req.Tools)
 	sess.LastAnswer = answer
 	sess.LastImages = images
 	sess.LastReqHash = hash

@@ -206,6 +206,28 @@ func echoBloatSkipped(saved, incoming []message, tol int) (bool, int) {
 	return true, skipped
 }
 
+// systemOnlyDivergence reports whether saved and incoming differ only in
+// system-role messages at the same positions: a regenerated system prompt
+// (tool-set flip) over an untouched conversation. Non-system messages must
+// be canonically identical — assistant echo bloat does NOT compose here;
+// that shape keeps the echo path (or reseeds when both diverge). A shorter
+// incoming (truncation) fails closed to the reseed path.
+func systemOnlyDivergence(saved, incoming []message) bool {
+	if len(incoming) < len(saved) {
+		return false
+	}
+	for i := range saved {
+		a, b := saved[i], incoming[i]
+		if a.Role == "system" && b.Role == "system" {
+			continue
+		}
+		if !canonicalEqual(a, b) {
+			return false
+		}
+	}
+	return true
+}
+
 // coherentTranscript reports whether msgs is internally coherent: valid
 // tool-call/result pairing in order (every tool result matches a prior
 // assistant call exactly once, results are nonempty, call IDs are nonempty
