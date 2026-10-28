@@ -641,6 +641,9 @@ func systemPrompt(tools []toolDef, choice string) string {
 func (h *handler) writeError(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
+	// Every refusal lands one terminal line: status plus reason. Refusals
+	// used to be silent, leaving only user-visible text to diagnose from.
+	log.Printf("[openai] refused status=%d code=%s msg=%.300s", status, code, msg)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{"message": msg, "type": code, "code": code},
 	})
@@ -688,6 +691,13 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		sess = &session{}
 		h.sessions[sid] = sess
+	}
+	{
+		thread := "none"
+		if sess.URL != "" {
+			thread = "stored"
+		}
+		log.Printf("[openai] session=%s request in=%d saved=%d thread=%s pending=%v", shortSID(sid), len(req.Messages), len(sess.Messages), thread, sess.Pending)
 	}
 	// Exact last-request retry: same bytes, same completion identity.
 	// The cached answer is re-validated (schemas may have changed) and the
@@ -756,7 +766,12 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var recordMsgs []message
 	var sysHead string
 	fresh := true
-	if reseedPlan == nil && h.hasActive && h.activeSID == sid && len(sess.Messages) > 0 && len(req.Messages) >= len(sess.Messages) {
+	// Delta when the incoming history extends the stored prefix. The fast
+	// path needs the tab on this session's thread (single live tab): the
+	// in-memory slot proves it, or — after a restart wiped the slot — a
+	// read-only check that the tab never moved proves it. Anything else
+	// starts a new chat rather than appending to the wrong thread.
+	if reseedPlan == nil && len(sess.Messages) > 0 && len(req.Messages) >= len(sess.Messages) {
 		match := true
 		for i := range sess.Messages {
 			if !canonicalEqual(sess.Messages[i], req.Messages[i]) {
@@ -765,11 +780,18 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if match {
-			fresh = false
-			if teach := h.teachReminder(req, sess); teach != "" {
-				sysHead = teach + "\n\n"
+			if h.hasActive && h.activeSID == sid {
+				fresh = false
+			} else if sess.URL != "" && h.currentThreadURL(r.Context()) == sess.URL {
+				fresh = false
+				log.Printf("[openai] session=%s thread-rejoin tab still on stored thread; continuing delta", shortSID(sid))
 			}
-			seedMsgs = req.Messages[len(sess.Messages):]
+			if !fresh {
+				if teach := h.teachReminder(req, sess); teach != "" {
+					sysHead = teach + "\n\n"
+				}
+				seedMsgs = req.Messages[len(sess.Messages):]
+			}
 		}
 	}
 	if fresh {
@@ -831,7 +853,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	log.Printf("[openai] session=%s plan turns=%d sizes=%v replay=%v paste_limit=%d", shortSID(sid), len(allTurns), sizes, replays, limit)
+	log.Printf("[openai] session=%s plan turns=%d sizes=%v replay=%v paste_limit=%d seed=%d roles=%s record=%d", shortSID(sid), len(allTurns), sizes, replays, limit, len(seedMsgs), roleInitials(seedMsgs), len(recordMsgs))
 	if len(allTurns) == 0 {
 		h.mu.Unlock()
 		h.writeError(w, http.StatusBadRequest, "invalid_request_error", "no submission turns")
@@ -1015,6 +1037,27 @@ func (h *handler) teachReminder(req chatRequest, sess *session) string {
 	_ = sess
 	return "Reminder: available functions: " + strings.Join(names, ", ") +
 		". Reply with ONLY <opencode_bridge_call> wrappers to call one, else plain text."
+}
+
+// roleInitials renders message roles as content-free initials (u/a/t/s)
+// so logs show suffix composition without any text.
+func roleInitials(msgs []message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		switch m.Role {
+		case "user":
+			b.WriteByte('u')
+		case "assistant":
+			b.WriteByte('a')
+		case "tool":
+			b.WriteByte('t')
+		case "system":
+			b.WriteByte('s')
+		default:
+			b.WriteByte('?')
+		}
+	}
+	return b.String()
 }
 
 // formatForBrowser renders one client message as browser-submitted text.

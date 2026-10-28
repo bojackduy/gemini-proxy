@@ -1586,3 +1586,47 @@ func TestSecondTurnSkipsOwnAnswerImport(t *testing.T) {
 		t.Fatalf("no import on a clean continuation: %q", fake.prompts[0])
 	}
 }
+
+func TestThreadRejoinAfterSlotLoss(t *testing.T) {
+	const threadURL = "https://gemini.google.com/app/THREAD"
+	newRejoinHandler := func(urlNow string) (*fakeRecoveryBackend, *handler) {
+		fake := &fakeRecoveryBackend{urlNow: urlNow}
+		fake.answerFor = func(prompt string) string {
+			if strings.Contains(prompt, "HISTORY IMPORT") || strings.Contains(prompt, "PRIOR EXECUTION RECORD") {
+				return "ACK"
+			}
+			return "rejoin answer"
+		}
+		// No hasActive slot: simulates a wiped single-slot store after
+		// an adapter restart. Delta must still engage when the tab never
+		// moved, proven read-only against the stored thread URL.
+		h := &handler{model: "gemini-web", client: fake, maxChars: 200000, gate: make(chan struct{}, 1),
+			sessions: map[string]*session{"rj": {Messages: []message{{Role: "user", Content: "q0"}}, URL: threadURL}}}
+		h.gate <- struct{}{}
+		return fake, h
+	}
+	incoming := []message{{Role: "user", Content: "q0"}, {Role: "user", Content: "q1"}}
+	t.Run("tab unmoved rejoins delta", func(t *testing.T) {
+		fake, h := newRejoinHandler(threadURL)
+		w := postJSON(t, h, "rj", chatRequest{Model: "gemini-web", Messages: incoming})
+		if w.Code != http.StatusOK {
+			t.Fatalf("rejoin: %d %s", w.Code, w.Body.String())
+		}
+		if fake.asks != 1 || len(fake.freshFlags) != 1 || fake.freshFlags[0] {
+			t.Fatalf("tab on stored thread must delta once: asks=%d fresh=%v", fake.asks, fake.freshFlags)
+		}
+		if got := h.sessions["rj"].URL; got != threadURL {
+			t.Fatalf("thread moved: %s", got)
+		}
+	})
+	t.Run("tab moved starts fresh", func(t *testing.T) {
+		fake, h := newRejoinHandler("https://gemini.google.com/app/ELSEWHERE")
+		w := postJSON(t, h, "rj", chatRequest{Model: "gemini-web", Messages: incoming})
+		if w.Code != http.StatusOK {
+			t.Fatalf("moved tab: %d %s", w.Code, w.Body.String())
+		}
+		if len(fake.freshFlags) == 0 || !fake.freshFlags[0] {
+			t.Fatalf("moved tab must start a new chat, never append: fresh=%v", fake.freshFlags)
+		}
+	})
+}
