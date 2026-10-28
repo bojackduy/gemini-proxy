@@ -129,6 +129,14 @@ func ExtractExecutableCalls(text string, schemas map[string]*jsonschema.Schema, 
 	scannable := StripFences(text)
 	wrappers := BridgeWrappers(scannable)
 	if len(wrappers) == 0 {
+		// A dangling opener with no valid wrapper is a botched tool
+		// attempt (broken JSON, mismatched close tag), not prose: fail
+		// closed instead of delivering the junk as assistant text.
+		// Fenced examples never reach here (stripped above), so a bare
+		// marker in live text means the model tried and failed.
+		if incompleteBridgeRe.MatchString(scannable) {
+			return nil, fmt.Errorf("incomplete opencode_bridge_call wrapper: opening tag without a complete valid wrapper")
+		}
 		if toolChoice == "required" {
 			return nil, fmt.Errorf("tool_choice required but answer contains no bridge wrapper")
 		}

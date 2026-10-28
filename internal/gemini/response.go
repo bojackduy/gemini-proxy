@@ -29,6 +29,11 @@ import (
 // wrappers (non-greedy, dot-all emulated with [\s\S]).
 var bridgeCallRe = regexp.MustCompile(`(?s)<opencode_bridge_call>[\s\S]*?</opencode_bridge_call>`)
 
+// incompleteBridgeRe spots a dangling bridge-call tag — an opener that
+// never became a valid wrapper (broken JSON, mismatched close tag).
+// Mirrors the chatgpt-proxy toolMarker tripwire.
+var incompleteBridgeRe = regexp.MustCompile(`</?opencode_bridge_call`)
+
 // tagRe strips any HTML tag.
 var tagRe = regexp.MustCompile(`<[^>]*>`)
 
@@ -763,18 +768,18 @@ func htmlToMarkdownFrom(s string) string {
 	s = regexp.MustCompile(`(?s)<pre[^>]*>\s*<code[^>]*class="[^"]*language-([a-zA-Z0-9+#-]+)[^"]*"[^>]*>(.*?)</code>\s*</pre>`).
 		ReplaceAllStringFunc(s, func(m string) string {
 			parts := regexp.MustCompile(`(?s)<pre[^>]*>\s*<code[^>]*class="[^"]*language-([a-zA-Z0-9+#-]+)[^"]*"[^>]*>(.*?)</code>\s*</pre>`).FindStringSubmatch(m)
-	// Strip syntax-highlight spans BEFORE decoding source entities, then
-		// keep source escaped until the final prose-tag cleanup has run.
-		lang, code := parts[1], escapeCodeSource(parts[2])
-		fence := "```"
-		if strings.Contains(html.UnescapeString(code), "```") {
-			fence = ticks(html.UnescapeString(code))
-			if len(fence) < 3 {
-				fence = "```"
+			// Strip syntax-highlight spans BEFORE decoding source entities, then
+			// keep source escaped until the final prose-tag cleanup has run.
+			lang, code := parts[1], escapeCodeSource(parts[2])
+			fence := "```"
+			if strings.Contains(html.UnescapeString(code), "```") {
+				fence = ticks(html.UnescapeString(code))
+				if len(fence) < 3 {
+					fence = "```"
+				}
 			}
-		}
-		return "\n" + fence + lang + "\n" + strings.Trim(code, "\n") + "\n" + fence + "\n"
-	})
+			return "\n" + fence + lang + "\n" + strings.Trim(code, "\n") + "\n" + fence + "\n"
+		})
 	s = regexp.MustCompile(`(?s)<pre[^>]*>(.*?)</pre>`).ReplaceAllStringFunc(s, func(m string) string {
 		code := escapeCodeSource(regexp.MustCompile(`(?s)<pre[^>]*>(.*?)</pre>`).FindStringSubmatch(m)[1])
 		fence := "```"

@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -144,5 +145,23 @@ func TestMarshalRoundTrip(t *testing.T) {
 	var back BridgeCall
 	if err := json.Unmarshal(b, &back); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestExtractMismatchedWrapperRejected(t *testing.T) {
+	// Live hallucination: opener, broken JSON (unescaped quotes), wrong
+	// close tag. Must fail closed, never deliver the junk as text.
+	text := "<opencode_bridge_call>" + `{"name":"execute","arguments":{"code":"return tools.opencode"skill" ? 1 : 2"}}` + "</opencode_bridge_link>"
+	if _, err := ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
+		t.Fatal("expected incomplete-wrapper rejection")
+	} else if !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("wrong rejection: %v", err)
+	}
+}
+
+func TestExtractPlainProseStillPasses(t *testing.T) {
+	calls, err := ExtractExecutableCalls("just a plain answer, no tags", testSchemas(t), "auto")
+	if err != nil || len(calls) != 0 {
+		t.Fatalf("plain prose must pass through: calls=%v err=%v", calls, err)
 	}
 }
