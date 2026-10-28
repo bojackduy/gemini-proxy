@@ -41,6 +41,54 @@ const (
 type prefixMismatch struct {
 	Index int
 	Field string
+	// Content-free shape of the mismatched values: "str:<bytes>:<lines>",
+	// "parts:<n>", "null" or "other". Lengths distinguish wrappers and
+	// rewrites without revealing any text.
+	IncomingShape string
+	SavedShape    string
+	// ContentOff is the first differing byte offset for string-vs-string
+	// content (else -1). Offsets pinpoint append-vs-rewrite classes
+	// (trailing newline, truncation marker, re-encode tail) without
+	// revealing any text.
+	ContentOff int
+}
+
+func contentShape(v any) string {
+	switch c := v.(type) {
+	case nil:
+		return "null"
+	case string:
+		return fmt.Sprintf("str:%d:%d", len(c), len(strings.Split(c, "\n")))
+	case []any:
+		return fmt.Sprintf("parts:%d", len(c))
+	default:
+		return "other"
+	}
+}
+
+// firstDiffOff returns the first differing byte offset of two strings, or
+// min(len) when one is a prefix of the other. Structural evidence only.
+func firstDiffOff(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
+// shapeBytes parses the byte count out of a "str:<bytes>:<lines>" shape,
+// or -1 when the value is not a plain string.
+func shapeBytes(shape string) int {
+	var n, l int
+	if _, err := fmt.Sscanf(shape, "str:%d:%d", &n, &l); err != nil {
+		return -1
+	}
+	return n
 }
 
 // rewritePlan is a validated fresh-chat reseed. carried holds committed
@@ -62,12 +110,13 @@ type rewritePlan struct {
 // a prefix of incoming (coherent append-only: no rewrite).
 func firstMismatch(incoming, saved []message) *prefixMismatch {
 	for i := range saved {
-		m := &prefixMismatch{Index: i}
+		m := &prefixMismatch{Index: i, ContentOff: -1}
 		if i >= len(incoming) {
 			m.Field = "history.truncated"
 			return m
 		}
 		a, b := incoming[i], saved[i]
+		m.IncomingShape, m.SavedShape = contentShape(a.Content), contentShape(b.Content)
 		switch {
 		case a.Role != b.Role:
 			m.Field = "role"
@@ -77,6 +126,11 @@ func firstMismatch(incoming, saved []message) *prefixMismatch {
 			m.Field = "tool_call_id"
 		case textOf(a) != textOf(b):
 			m.Field = "content"
+			if ai, ok := a.Content.(string); ok {
+				if bi, ok := b.Content.(string); ok {
+					m.ContentOff = firstDiffOff(ai, bi)
+				}
+			}
 		case len(a.ToolCalls) != len(b.ToolCalls):
 			m.Field = "tool_calls.length"
 		default:

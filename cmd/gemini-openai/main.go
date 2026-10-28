@@ -788,8 +788,8 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// mismatch path always carries the record and evidence.
 		if reseedPlan == nil && len(sess.Messages) > 0 && sess.URL != "" {
 			if mm := firstMismatch(req.Messages, sess.Messages); mm != nil {
-				log.Printf("[openai] session=%s prefix_mismatch index=%d field=%s incoming_messages=%d saved_messages=%d",
-					shortSID(sid), mm.Index, mm.Field, len(req.Messages), len(sess.Messages))
+				log.Printf("[openai] session=%s prefix_mismatch index=%d field=%s confoff=%d incoming_messages=%d saved_messages=%d incoming_shape=%s saved_shape=%s",
+					shortSID(sid), mm.Index, mm.Field, mm.ContentOff, len(req.Messages), len(sess.Messages), mm.IncomingShape, mm.SavedShape)
 				reseedPlan = planCleanReseed(sess, req.Messages)
 				if reseedPlan != nil {
 					log.Printf("[openai] session=%s rewrite_reseed classification=%s carried=%d not_carried=%d old=%s",
