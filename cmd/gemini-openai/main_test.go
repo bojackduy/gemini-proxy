@@ -2378,3 +2378,144 @@ func TestCompactionOnDirtySessionStillReseeds(t *testing.T) {
 		t.Fatal("dirty reseed must abandon the old thread")
 	}
 }
+
+func recoverTestHandler(fake *fakeRecoveryBackend, s *session) *handler {
+	h := &handler{model: "gemini-web", client: fake, gate: make(chan struct{}, 1),
+		statePath: filepath.Join(os.TempDir(), "gemini-recover-test-state.json"),
+		sessions:  map[string]*session{}}
+	if s != nil {
+		h.sessions["s"] = s
+	}
+	h.gate <- struct{}{}
+	return h
+}
+
+func postRecover(t *testing.T, h *handler, sid string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest("POST", "/v1/sessions/recover", nil)
+	if sid != "" {
+		r.Header.Set("X-Session-Id", sid)
+	}
+	for k, v := range headers {
+		r.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	h.routes().ServeHTTP(w, r)
+	return w
+}
+
+func TestRecoverAdoptsPendingTurn(t *testing.T) {
+	req := chatRequest{Model: "gemini-web", Messages: []message{{Role: "user", Content: "hello"}}}
+	fake := &fakeRecoveryBackend{
+		readTurn: func(url, prompt string) (gemini.TurnResult, error) {
+			if url != "https://gemini.google.com/app/abc" || prompt != "SUBMITTED-PROMPT" {
+				return gemini.TurnResult{}, structuralMismatch()
+			}
+			return gemini.TurnResult{Answer: "adopted answer", URL: url}, nil
+		},
+		readLatest: func(url string) (string, gemini.TurnResult, error) {
+			return "", gemini.TurnResult{}, errors.New("unused on the adoption path")
+		},
+	}
+	h := recoverTestHandler(fake, &session{Pending: true, PendingPrompt: "SUBMITTED-PROMPT",
+		URL:             "https://gemini.google.com/app/abc",
+		PendingMessages: req.Messages, PendingReqHash: reqHash(&req)})
+	w := postRecover(t, h, "s", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("adoptable pending must recover: %d %s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("recover body must be JSON: %v", err)
+	}
+	if body["recovered"] != true || body["session"] != "s" {
+		t.Fatalf("recover body must confirm the session: %v", body)
+	}
+	if _, ok := body["cached_tool_calls"].(float64); !ok {
+		t.Fatalf("recover body must carry cached_tool_calls for the shared report: %v", body)
+	}
+	if _, ok := body["response_bytes"].(float64); !ok {
+		t.Fatalf("recover body must carry response_bytes for the shared report: %v", body)
+	}
+	s := h.sessions["s"]
+	if s.Pending || s.LastAnswer != "adopted answer" {
+		t.Fatalf("recover must commit the adopted turn: %+v", s)
+	}
+	if fake.asks != 0 {
+		t.Fatalf("recovery must never submit: asks=%d", fake.asks)
+	}
+}
+
+func TestRecoverRefusesWithoutAdoptableAnswer(t *testing.T) {
+	fake := &fakeRecoveryBackend{
+		readTurn: func(url, prompt string) (gemini.TurnResult, error) {
+			return gemini.TurnResult{}, errors.New("stored thread answer is not a finished rendering")
+		},
+		readLatest: func(url string) (string, gemini.TurnResult, error) {
+			return "", gemini.TurnResult{}, errors.New("stored thread holds no complete assistant answer to adopt")
+		},
+	}
+	h := recoverTestHandler(fake, &session{Pending: true, PendingPrompt: "SUBMITTED-PROMPT",
+		URL:             "https://gemini.google.com/app/abc",
+		PendingMessages: []message{{Role: "user", Content: "hello"}}})
+	h.adoptWait = time.Millisecond
+	w := postRecover(t, h, "s", nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("unadoptable pending must refuse 409: %d %s", w.Code, w.Body.String())
+	}
+	if !h.sessions["s"].Pending {
+		t.Fatal("refused recovery must keep the uncertainty")
+	}
+}
+
+func TestRecoverGuards(t *testing.T) {
+	fake := &fakeRecoveryBackend{}
+	newHandler := func() *handler { return recoverTestHandler(fake, nil) }
+
+	w := postRecover(t, newHandler(), "unknown-session", nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("unknown session must refuse 409: %d", w.Code)
+	}
+
+	h := newHandler()
+	h.sessions["clean"] = &session{Messages: []message{{Role: "user", Content: "hi"}}}
+	w = postRecover(t, h, "clean", nil)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "no uncertain pending turn") {
+		t.Fatalf("clean session must refuse 409: %d %s", w.Code, w.Body.String())
+	}
+
+	r := httptest.NewRequest("GET", "/v1/sessions/recover", nil)
+	r.Header.Set("X-Session-Id", "s")
+	w = httptest.NewRecorder()
+	newHandler().routes().ServeHTTP(w, r)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("recover requires POST: %d", w.Code)
+	}
+
+	w = postRecover(t, newHandler(), "s", map[string]string{"Origin": "https://gemini.google.com"})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("browser-originated recovery must be forbidden: %d", w.Code)
+	}
+
+	w = postRecover(t, newHandler(), "", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("missing session must refuse 400: %d", w.Code)
+	}
+
+	w = postRecover(t, newHandler(), "all", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("wildcard session must refuse 400: %d", w.Code)
+	}
+
+	busy := newHandler()
+	<-busy.gate // drain: adapter busy
+	busy.sessions["s"] = &session{Pending: true, PendingPrompt: "x", URL: "https://gemini.google.com/app/abc",
+		PendingMessages: []message{{Role: "user", Content: "x"}}}
+	w = postRecover(t, busy, "s", nil)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("busy adapter must refuse 503: %d", w.Code)
+	}
+	if !busy.sessions["s"].Pending {
+		t.Fatal("busy refusal must change nothing")
+	}
+}

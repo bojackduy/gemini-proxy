@@ -283,6 +283,76 @@ func (h *handler) tryAutoResync(r *http.Request, id string, s *session, mismatch
 	return true
 }
 
+// recoverSession runs explicit read-only recovery for one pending session:
+// adoption of the stored answer (exact, key or window identity), then
+// hash-lineage auto-resync — the same recoverPending the dirty path runs.
+// It never submits and never executes tools. POST only, one session named
+// by the session headers (wildcards refused), never concurrent with a
+// browser turn: like abandon it takes the whole-turn gate without queuing,
+// and a busy adapter refuses. The 200 body matches the shared recovery
+// report shape (cached_tool_calls, response_bytes).
+func (h *handler) recoverSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		h.writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "recover requires POST")
+		return
+	}
+	// Operator-only read of the owned tab, not a browser API. Reject
+	// browser-originated requests, including cross-site POSTs to loopback.
+	if r.Header.Get("Origin") != "" {
+		h.writeError(w, http.StatusForbidden, "invalid_request_error", "browser-originated recovery is forbidden")
+		return
+	}
+	id := sessionID(r)
+	if id == "" {
+		h.writeError(w, http.StatusBadRequest, "invalid_request_error", "session header required")
+		return
+	}
+	if why := unresolvableList(id); why != "" {
+		h.writeError(w, http.StatusBadRequest, "invalid_request_error", why)
+		return
+	}
+	select {
+	case <-h.gate:
+		defer func() { h.gate <- struct{}{} }()
+	case <-r.Context().Done():
+		h.writeError(w, http.StatusRequestTimeout, "timeout", "request canceled while queued")
+		return
+	default:
+		h.writeError(w, http.StatusServiceUnavailable, "server_error", "browser turn busy; retry when the adapter is idle")
+		return
+	}
+	h.mu.Lock()
+	pending := h.sessions[id] != nil && h.sessions[id].Pending
+	h.mu.Unlock()
+	if !pending {
+		h.mu.Lock()
+		diag := h.sentDiagnosis(id, h.sessions[id])
+		h.mu.Unlock()
+		h.writeError(w, http.StatusConflict, "invalid_request_error", "no uncertain pending turn for this session; "+diag)
+		return
+	}
+	if !h.recoverPending(r, id) {
+		h.mu.Lock()
+		diag := h.sentDiagnosis(id, h.sessions[id])
+		h.mu.Unlock()
+		h.writeError(w, http.StatusConflict, "invalid_request_error", "no completed answer to adopt yet; "+diag)
+		return
+	}
+	h.mu.Lock()
+	calls, bytes := 0, 0
+	if s := h.sessions[id]; s != nil {
+		calls, bytes = len(s.LastToolIDs), len(s.LastAnswer)
+	}
+	h.mu.Unlock()
+	log.Printf("[openai] session=%s explicit recover adopted cached_calls=%d response_bytes=%d", shortSID(id), calls, bytes)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"recovered": true, "session": id,
+		"cached_tool_calls": calls, "response_bytes": bytes,
+		"next": "send the same message again, unchanged — the bridge returns the stored reply instead of asking Gemini",
+	})
+}
+
 // recoverPending runs the full Dirty-path recovery for one session: exact
 // adoption first, then hash-lineage auto-resync on structural mismatch.
 // True means the journal now holds the completed turn and the caller should
