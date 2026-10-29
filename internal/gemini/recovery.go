@@ -59,11 +59,11 @@ func AnswerHash(answer string) string {
 //   - answer side: VERIFIED 2026-10-14 (model-response, message-content[id],
 //     .markdown aria-busy, .response-footer.complete, localized stop
 //     buttons) — the same finishedness proof as the submit path.
-//   - user side: UNVERIFIED against the signed-in DOM (user-query custom
-//     elements). Adoption requires FULL normalized equality, which is
-//     self-validating: a wrong or absent node can only mismatch (safe),
-//     never falsely adopt. There is deliberately NO bounded-transform class
-//     for Gemini until a renderer transform is observed and enumerated.
+//   - user side: the renderer expands submitted whitespace (observed
+//     2026-10-29: 354B paste, 475B bubble), so identity is tiered:
+//     exact bytes, then whitespace-key equality (same words, same order),
+//     then the long-prompt edge window. A wrong or absent node still
+//     mismatches under every tier (safe), never falsely adopts.
 // ---------------------------------------------------------------------------
 
 // TurnResult is one verifiably-completed thread answer.
@@ -75,6 +75,33 @@ type TurnResult struct {
 	// (inline data: payloads within caps). Empty for text-only turns; the
 	// Answer text always carries the fixtures and notes regardless.
 	Images []ResponseImage
+}
+
+// PromptKey is the prompt identity a textarea round trip preserves: words
+// and their order, with whitespace runs treated as a single separator.
+// Adoption's second tier: a rendered bubble that matches the pending prompt
+// under this key differs by rendering whitespace only (observed 2026-10-29:
+// a 354B paste rendered as a 475B bubble). Equality here proves the same
+// submission; a reworded, reordered or different message still mismatches.
+func PromptKey(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// promptWindow accepts a rendered bubble whose leading and trailing runes
+// match the pending prompt while the length stays within an eighth.
+// Interior re-rendering is tolerated; a different message is not. Ported
+// from the ChatGPT bridge's samePromptWindow for long-prompt parity.
+func promptWindow(have, want string) bool {
+	h := []rune(PromptKey(have))
+	w := []rune(PromptKey(want))
+	const edge = 200
+	if len(w) < 2*edge || len(h) < 2*edge {
+		return false
+	}
+	if d := len(h) - len(w); d > len(w)/8 || d < -len(w)/8 {
+		return false
+	}
+	return string(h[:edge]) == string(w[:edge]) && string(h[len(h)-edge:]) == string(w[len(w)-edge:])
 }
 
 // UserBubbleMismatchError is the structural adoption failure: the thread's
@@ -243,12 +270,13 @@ func (c *Client) snapshotThreadLocked(ctx context.Context, url string) (threadSn
 	return snap, nil
 }
 
-// ReadThreadTurn reads the owned thread's finished answer for the exact
-// pending prompt. The latest user turn must FULLY equal the normalized
-// pending prompt (no transform class); a verifiably complete assistant
-// rendering must follow it. Anything else fails closed: typed mismatch for
-// structural divergence (auto-resync may still recover), plain errors for
-// unfinished/absent state (caller keeps 409).
+// ReadThreadTurn reads the owned thread's finished answer for the pending
+// prompt. The latest user turn must identify as the normalized pending
+// prompt under a tiered identity — exact bytes, then whitespace-key
+// equality (rendering whitespace only), then the long-prompt edge window —
+// and a verifiably complete assistant rendering must follow it. Anything
+// else fails closed: typed mismatch for structural divergence (auto-resync
+// may still recover), plain errors for unfinished/absent state.
 func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnResult, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return TurnResult{}, errors.New("recovery requires a stored thread and exact original prompt")
@@ -263,13 +291,23 @@ func (c *Client) ReadThreadTurn(ctx context.Context, url, prompt string) (TurnRe
 		return TurnResult{}, err
 	}
 	want := NormalizePrompt(prompt)
-	if !snap.userFound || snap.userText == "" || snap.userText != want {
+	identity := ""
+	switch {
+	case snap.userFound && snap.userText != "" && snap.userText == want:
+		identity = "exact"
+	case snap.userFound && snap.userText != "" && PromptKey(want) != "" && PromptKey(snap.userText) == PromptKey(want):
+		identity = "key"
+	case snap.userFound && snap.userText != "" && promptWindow(snap.userText, want):
+		identity = "window"
+	}
+	if identity == "" {
 		off := FirstDiffByte(snap.userText, want)
 		spans := DiffSpans(snap.userText, want)
-		log.Printf("[gemini] adoption user-query mismatch rendered=%dB want=%dB diffoff=%d spans=%s",
-			len(snap.userText), len(want), off, spans)
+		log.Printf("[gemini] adoption user-query mismatch rendered=%dB want=%dB keyrendered=%dB keywant=%dB diffoff=%d spans=%s",
+			len(snap.userText), len(want), len(PromptKey(snap.userText)), len(PromptKey(want)), off, spans)
 		return TurnResult{}, &UserBubbleMismatchError{Path: "user-query", Rendered: len(snap.userText), Want: len(want), DiffOff: off, Spans: spans}
 	}
+	log.Printf("[gemini] adoption user-query identity=%s rendered=%dB want=%dB", identity, len(snap.userText), len(want))
 	return gateThreadAnswer(url, snap)
 }
 
