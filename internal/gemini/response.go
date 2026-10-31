@@ -495,7 +495,7 @@ func ConvertResponseWithLiveImages(fragment string, imgLive, canvasLive []liveIm
 		if text == "ACK" {
 			return text, nil
 		}
-		return htmlToMarkdown(fragment), nil
+		return geminiHTMLToMarkdown(fragment), nil
 	}
 	md := htmlToMarkdownWithNodes(fragment, nodes)
 	images := extractImagesFromNodes(nodes)
@@ -711,14 +711,14 @@ func ConvertResponseWithImages(fragment string) (string, []ResponseImage) {
 		if text == "ACK" {
 			return text, nil
 		}
-		return htmlToMarkdown(fragment), nil
+		return geminiHTMLToMarkdown(fragment), nil
 	}
 	// Image path: parsed nodes, dangling model-emitted "[Image N]" markers,
 	// or both. The wire fast path is intentionally skipped here: an
 	// image-only answer must yield its fixtures (not ""), and wrapper text
 	// mixed with image content must reach validation as markdown, never
 	// execute from raw.
-	md := htmlToMarkdown(fragment)
+	md := geminiHTMLToMarkdown(fragment)
 	images := ExtractResponseImages(fragment)
 	if n := omittedImageCount(fragment, len(images)); n > 0 {
 		md += "\n\n[" + pluralImages(n) + " omitted: exceeds per-turn image budget]"
@@ -738,7 +738,7 @@ func pluralImages(n int) string {
 // It handles the constructs Gemini's renderer emits; anything unrecognized
 // degrades to its text content (never dropped silently, never raw HTML kept
 // except inside fenced code spans which are text by definition).
-func htmlToMarkdown(fragment string) string {
+func geminiHTMLToMarkdown(fragment string) string {
 	s := fragment
 
 	// Remove non-content first: scripts, styles, buttons, toolbars, hidden

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bojackduy/bridgecore"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -68,7 +69,7 @@ func TestParseBridgeCallNonObjectArgs(t *testing.T) {
 
 func TestExtractCleanWrapper(t *testing.T) {
 	text := "<opencode_bridge_call>\n" + `{"name":"get_weather","arguments":{"city":"Hanoi"}}` + "\n</opencode_bridge_call>"
-	calls, err := ExtractExecutableCalls(text, testSchemas(t), "auto")
+	calls, err := bridgecore.ExtractExecutableCalls(text, testSchemas(t), "auto")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,39 +80,35 @@ func TestExtractCleanWrapper(t *testing.T) {
 
 func TestExtractUnknownNameRejected(t *testing.T) {
 	text := `<opencode_bridge_call>{"name":"nope","arguments":{}}</opencode_bridge_call>`
-	if _, err := ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
+	if _, err := bridgecore.ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
 		t.Fatal("expected unknown-name rejection")
 	}
 }
 
 func TestExtractSchemaViolationRejected(t *testing.T) {
 	text := `<opencode_bridge_call>{"name":"get_weather","arguments":{}}</opencode_bridge_call>`
-	if _, err := ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
+	if _, err := bridgecore.ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
 		t.Fatal("expected schema-violation rejection (missing city)")
 	}
 }
 
 func TestExtractProseMixedRejected(t *testing.T) {
 	text := "Here you go:\n<opencode_bridge_call>" + `{"name":"get_weather","arguments":{"city":"Hanoi"}}` + "</opencode_bridge_call>"
-	if _, err := ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
+	if _, err := bridgecore.ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
 		t.Fatal("expected prose-mixed rejection")
 	}
 }
 
 func TestExtractFencedWrapperIgnored(t *testing.T) {
 	text := "```json\n<opencode_bridge_call>" + `{"name":"get_weather","arguments":{"city":"Hanoi"}}` + "</opencode_bridge_call>\n```"
-	calls, err := ExtractExecutableCalls(text, testSchemas(t), "auto")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(calls) != 0 {
-		t.Fatalf("fenced wrapper must not execute: %+v", calls)
+	if _, err := bridgecore.ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
+		t.Fatal("fenced wrapper must be rejected, not ignored")
 	}
 }
 
 func TestExtractToolChoiceNone(t *testing.T) {
 	text := `<opencode_bridge_call>{"name":"get_weather","arguments":{"city":"Hanoi"}}</opencode_bridge_call>`
-	if _, err := ExtractExecutableCalls(text, testSchemas(t), "none"); err == nil {
+	if _, err := bridgecore.ExtractExecutableCalls(text, testSchemas(t), "none"); err == nil {
 		t.Fatal("expected tool_choice=none rejection")
 	}
 }
@@ -131,7 +128,7 @@ func TestExtractToolChoiceForcedMismatch(t *testing.T) {
 	}
 	schemas := map[string]*jsonschema.Schema{"a": sch, "b": sch}
 	text := `<opencode_bridge_call>{"name":"a","arguments":{}}</opencode_bridge_call>`
-	if _, err := ExtractExecutableCalls(text, schemas, "b"); err == nil {
+	if _, err := bridgecore.ExtractExecutableCalls(text, schemas, "b"); err == nil {
 		t.Fatal("expected forced-choice mismatch rejection")
 	}
 }
@@ -152,7 +149,7 @@ func TestExtractMismatchedWrapperRejected(t *testing.T) {
 	// Live hallucination: opener, broken JSON (unescaped quotes), wrong
 	// close tag. Must fail closed, never deliver the junk as text.
 	text := "<opencode_bridge_call>" + `{"name":"execute","arguments":{"code":"return tools.opencode"skill" ? 1 : 2"}}` + "</opencode_bridge_link>"
-	if _, err := ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
+	if _, err := bridgecore.ExtractExecutableCalls(text, testSchemas(t), "auto"); err == nil {
 		t.Fatal("expected incomplete-wrapper rejection")
 	} else if !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("wrong rejection: %v", err)
@@ -160,7 +157,7 @@ func TestExtractMismatchedWrapperRejected(t *testing.T) {
 }
 
 func TestExtractPlainProseStillPasses(t *testing.T) {
-	calls, err := ExtractExecutableCalls("just a plain answer, no tags", testSchemas(t), "auto")
+	calls, err := bridgecore.ExtractExecutableCalls("just a plain answer, no tags", testSchemas(t), "auto")
 	if err != nil || len(calls) != 0 {
 		t.Fatalf("plain prose must pass through: calls=%v err=%v", calls, err)
 	}

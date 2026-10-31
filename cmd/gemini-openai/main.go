@@ -33,6 +33,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bojackduy/bridgecore"
 	"github.com/bojackduy/gemini-proxy/internal/gemini"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -763,7 +764,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// The cached answer is re-validated (schemas may have changed) and the
 	// assistant message rebuilt deterministically with the stored IDs.
 	if sess.LastReqHash == hash && sess.LastRespID != "" {
-		calls, verr := gemini.ExtractExecutableCalls(sess.LastAnswer, schemas, choice)
+		calls, verr := bridgecore.ExtractExecutableCalls(sess.LastAnswer, schemas, choice)
 		if verr != nil {
 			diag := h.sentDiagnosis(sid, sess)
 			h.mu.Unlock()
@@ -1155,7 +1156,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Validate the protocol BEFORE emitting anything (buffered SSE).
 	log.Printf("[gemini-flow] id=%s session=%s stage=answer bytes=%d duration=%s", fid, shortSID(sid), len(answer), time.Since(started).Round(time.Millisecond))
-	calls, err := gemini.ExtractExecutableCalls(answer, schemas, choice)
+	calls, err := bridgecore.ExtractExecutableCalls(answer, schemas, choice)
 	if err != nil {
 		log.Printf("[gemini-flow] id=%s session=%s stage=protocol_validation result=rejected err=%v", fid, shortSID(sid), err)
 		h.mu.Lock()
@@ -1506,19 +1507,19 @@ type completion struct {
 	Usage   map[string]int     `json:"usage"`
 }
 
-func (h *handler) buildCompletion(req *chatRequest, answer string, images []gemini.ResponseImage, calls []*gemini.BridgeCall, toolIDs []string, created int64, id string) *completion {
+func (h *handler) buildCompletion(req *chatRequest, answer string, images []gemini.ResponseImage, calls []*bridgecore.BridgeCall, toolIDs []string, created int64, id string) *completion {
 	msg := message{Role: "assistant"}
 	finish := "stop"
 	if len(calls) > 0 {
 		for i, c := range calls {
-			rawArgs, _ := json.Marshal(c.Arguments)
 			tcID := fmt.Sprintf("call_rebuilt_%d", i)
+			rawArgs := c.RawArguments
 			if i < len(toolIDs) {
 				tcID = toolIDs[i]
 			}
 			msg.ToolCalls = append(msg.ToolCalls, toolCall{
 				ID: tcID, Type: "function",
-				Function: callFunction{Name: c.Name, Arguments: string(rawArgs)},
+				Function: callFunction{Name: c.Name, Arguments: rawArgs},
 			})
 		}
 		finish = "tool_calls"

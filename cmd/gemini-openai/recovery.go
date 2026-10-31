@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bojackduy/bridgecore"
 	"github.com/bojackduy/gemini-proxy/internal/gemini"
 )
 
@@ -137,7 +138,7 @@ func (h *handler) recordCompletedTurn(id string, s *session, answer string, imag
 		return false
 	}
 	choice := effectiveToolChoice(s.PendingChoice, len(s.PendingTools))
-	calls, err := gemini.ExtractExecutableCalls(answer, schemas, choice)
+	calls, err := bridgecore.ExtractExecutableCalls(answer, schemas, choice)
 	if err != nil {
 		log.Printf("[openai] session=%s recovery refused: thread answer fails strict protocol validation: %v", id, err)
 		return false
@@ -177,7 +178,7 @@ func (h *handler) recordCompletedTurn(id string, s *session, answer string, imag
 
 // rebuildToolCalls maps validated bridge calls onto wire tool calls with the
 // stored stable IDs (same shape as the normal completion path).
-func (h *handler) rebuildToolCalls(calls []*gemini.BridgeCall, toolIDs []string) []toolCall {
+func (h *handler) rebuildToolCalls(calls []*bridgecore.BridgeCall, toolIDs []string) []toolCall {
 	var out []toolCall
 	for i, c := range calls {
 		tcID := fmt.Sprintf("call_rebuilt_%d", i)
@@ -186,7 +187,7 @@ func (h *handler) rebuildToolCalls(calls []*gemini.BridgeCall, toolIDs []string)
 		}
 		out = append(out, toolCall{
 			ID: tcID, Type: "function",
-			Function: callFunction{Name: c.Name, Arguments: mustMarshalArgs(c.Arguments)},
+			Function: callFunction{Name: c.Name, Arguments: c.RawArguments},
 		})
 	}
 	return out
